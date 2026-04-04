@@ -1,0 +1,18 @@
+schema_version = "1.0.0"
+id = "pin_solver"
+version = "1.0.0"
+name = "PinSolver"
+tagline = "Interactive camera alignment"
+maintainer = "Naoki Korematsum"
+type = "add-on"
+blender_version_min = "4.2.0"
+license = ["SPDX:GPL-3.0-or-later"]
+tags = ["Tracking", "Camera", "3D View"]
+
+platforms = ["windows-x64", "macos-x64", "macos-arm64", "linux-x64"]
+wheels = [
+    "./wheels/opencv_python_headless-4.13.0.92-cp37-abi3-win_amd64.whl",
+    "./wheels/opencv_python_headless-4.13.0.92-cp37-abi3-macosx_13_0_arm64.whl",
+    "./wheels/opencv_python_headless-4.13.0.92-cp37-abi3-macosx_14_0_x86_64.whl",
+    "./wheels/opencv_python_headless-4.13.0.92-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl"
+]
