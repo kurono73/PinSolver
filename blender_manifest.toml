@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "pin_solver"
-version = "1.0.0"
+version = "1.0.1"
 name = "PinSolver"
 tagline = "Interactive camera alignment"
 maintainer = "Naoki Korematsum"
