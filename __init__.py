@@ -536,6 +536,21 @@ class PinSolverPin(PropertyGroup):
 class PinSolverTargetItem(PropertyGroup):
     obj: PointerProperty(type=bpy.types.Object, name="Object", description="Select the object to be aligned")
 
+# ==========================================
+# Draw Handler Management
+# ==========================================
+_draw_handle = None
+
+def update_show_overlays(self, context):
+    global _draw_handle
+    if self.show_overlays:
+        if _draw_handle is None:
+            _draw_handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_overlay, (), 'WINDOW', 'POST_PIXEL')
+    else:
+        if _draw_handle is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
+            _draw_handle = None
+
 class PinSolverData(PropertyGroup):
     picking_state: EnumProperty(items=[('NONE', "", ""), ('PICK_2D', "", ""), ('PICK_3D', "", "")], default='NONE')
     picking_index: IntProperty(default=-1)
@@ -544,7 +559,13 @@ class PinSolverData(PropertyGroup):
     layout_avg_error: FloatProperty(name="Layout Error", default=-1.0)
     mm_avg_error: FloatProperty(name="Sequence Error", default=-1.0)
     
-    show_overlays: BoolProperty(name="Show Pins", default=True, description="Toggle the visibility of all pins and lines in the 3D Viewport")
+    show_overlays: BoolProperty(
+        name="Show Pins", 
+        default=False, 
+        options={'SKIP_SAVE'}, 
+        update=update_show_overlays, 
+        description="Toggle the visibility of all pins and lines in the 3D Viewport"
+    )
     use_distortion_overlay: BoolProperty(name="Undistort 2D Pins", default=True, description="Un-distorts 2D pins in the viewport to match the linear 3D pins perfectly")
     is_tweak_mode: BoolProperty(default=False)
     is_edit_mode: BoolProperty(default=False)
@@ -663,7 +684,7 @@ def _solve_single_pin(context: bpy.types.Context, cam_mat_unscaled: Matrix, pin:
         F_vec = R_cv2world @ Vector((0, 0, 1))
         origin = C_old
 
-    if settings.lock_camera_z and abs(direction.z) > 1e-6:
+    if settings.lock_camera_z and not cam_data.is_tweak_mode and abs(direction.z) > 1e-6:
         t = (P.z - C_old.z) / direction.z
         if t <= 0.0: t = abs(t)
         if t < 1e-4: t = 1.0
@@ -993,6 +1014,7 @@ class PinSolverPickMixin:
     def invoke_common(self, context, target_state):
         cam_data, target_data, _ = get_active_target_data(context)
         if not target_data: return {'CANCELLED'}
+        cam_data.show_overlays = True
         pins, active_idx = get_pins(cam_data, target_data)
         idx = self.target_index if self.target_index != -1 else active_idx
         if idx < 0 or idx >= len(pins): return {'CANCELLED'}
@@ -1090,6 +1112,7 @@ class PINSOLVER_OT_add_pin(PinSolverBaseOperator):
     def execute(self, context):
         cam_data, target_data, _ = get_active_target_data(context)
         if not target_data: return {'CANCELLED'}
+        cam_data.show_overlays = True
         pins, active_idx = get_pins(cam_data, target_data)
         idx = len(pins)
         new_pin = pins.add()
@@ -1156,6 +1179,12 @@ class PINSOLVER_OT_solve(PinSolverBaseOperator):
     def execute(self, context):
         cam_data, target_data, target_obj = get_active_target_data(context)
         if not target_data: return {'CANCELLED'}
+
+        _, rv3d, _, _ = get_3d_region_context(context, cross_window=False)
+        if rv3d and rv3d.view_perspective != 'CAMERA':
+            rv3d.view_perspective = 'CAMERA'
+        cam_data.show_overlays = True
+
         success, result = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode=self.target_mode)
         if success and result:
             if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result):
@@ -2701,20 +2730,19 @@ class PINSOLVER_PT_panel(Panel):
 # 6. Registration & State Management
 # ==========================================
 class PinSolverAddon:
-    draw_handle = None
     @classmethod
     def register(cls):
         for c in classes: bpy.utils.register_class(c)
         bpy.types.Object.pinsolver_data = bpy.props.PointerProperty(type=PinSolverData)
         bpy.types.Scene.pinsolver_settings = bpy.props.PointerProperty(type=PinSolverSettings)
-        if cls.draw_handle is not None:
-            bpy.types.SpaceView3D.draw_handler_remove(cls.draw_handle, 'WINDOW')
-        cls.draw_handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_overlay, (), 'WINDOW', 'POST_PIXEL')
+
     @classmethod
     def unregister(cls):
-        if cls.draw_handle is not None:
-            bpy.types.SpaceView3D.draw_handler_remove(cls.draw_handle, 'WINDOW')
-            cls.draw_handle = None
+        global _draw_handle
+        if _draw_handle is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
+            _draw_handle = None
+            
         for c in reversed(classes): bpy.utils.unregister_class(c)
         del bpy.types.Object.pinsolver_data
         del bpy.types.Scene.pinsolver_settings
