@@ -35,8 +35,8 @@ class PinSolverConfig:
 
 class UIStrings:
     OVERLAY_EDIT_TITLE = "PinSolver - Pin Editor Mode"
-    OVERLAY_EDIT_SUB_LAYOUT = "Drag 2D(●)/3D(■) [Shift: Force 2D, Ctrl: Force 3D] | A: Add | X: Del | ESC: Exit"
-    OVERLAY_EDIT_SUB_MM = "Drag 3D(■) [Ctrl: Force 3D] | A: Add | X: Del | ESC: Exit"
+    OVERLAY_EDIT_SUB_LAYOUT = "Drag 2D(●)/3D(■) [Shift: Force 2D, Ctrl: Force 3D, Alt: Snap] | A: Add | X: Del | ESC: Exit"
+    OVERLAY_EDIT_SUB_MM = "Drag 3D(■) [Ctrl: Force 3D, Alt: Snap] | A: Add | X: Del | ESC: Exit"
     OVERLAY_TWEAK_ADD = "PinSolver - Add Pins (A)"
     OVERLAY_TWEAK_PAN = "PinSolver - Tweak (1 Pin: Pan)"
     OVERLAY_TWEAK_ORBIT = "PinSolver - Tweak (2 Pins: Orbit)"
@@ -475,7 +475,7 @@ def schedule_error_update():
         return None
     bpy.app.timers.register(delayed_update, first_interval=0.05)
 
-def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector) -> Tuple[bool, Optional[Vector]]:
+def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector, snap_to_vertex: bool = False) -> Tuple[bool, Optional[Vector]]:
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
     cur_origin = origin + direction * PinSolverConfig.RAYCAST_START_OFFSET 
@@ -486,6 +486,26 @@ def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector)
         if obj and obj.type in {'CAMERA', 'LIGHT', 'SPEAKER'}:
             cur_origin = loc + direction * 0.01
             continue
+            
+        if snap_to_vertex and obj and obj.type == 'MESH':
+            try:
+                eval_obj = obj.evaluated_get(depsgraph)
+                mesh = eval_obj.data
+                if mesh and hasattr(mesh, "polygons") and index < len(mesh.polygons):
+                    face = mesh.polygons[index]
+                    closest_v_loc = None
+                    min_dist = float('inf')
+                    for v_idx in face.vertices:
+                        v_world = matrix @ mesh.vertices[v_idx].co
+                        dist = (v_world - loc).length
+                        if dist < min_dist:
+                            min_dist = dist
+                            closest_v_loc = v_world
+                    if closest_v_loc:
+                        loc = closest_v_loc
+            except Exception:
+                pass
+                
         return True, loc
     return False, None
 
@@ -1203,7 +1223,9 @@ class PINSOLVER_OT_sync_clip(PinSolverBaseOperator):
         trk_cam = clip.tracking.camera
         cam_ref = context.scene.camera.data
         
-        trk_cam.distortion_model = 'POLYNOMIAL'
+        if trk_cam.k1 != 0.0 or trk_cam.k2 != 0.0 or trk_cam.k3 != 0.0:
+            trk_cam.distortion_model = 'POLYNOMIAL'
+            
         trk_cam.sensor_width = cam_ref.sensor_width
         trk_cam.focal_length = cam_ref.lens
         
@@ -1289,7 +1311,7 @@ class PINSOLVER_OT_pick_2d(PinSolverBaseOperator, PinSolverPickMixin):
 class PINSOLVER_OT_pick_3d(PinSolverBaseOperator, PinSolverPickMixin):
     bl_idname = "view3d.pinsolver_pick_3d"
     bl_label = "Pick 3D"
-    bl_description = "Pick a new 3D world position for the selected pin by clicking on a mesh surface"
+    bl_description = "Pick a new 3D world position for the selected pin by clicking on a mesh surface (Hold Alt to snap to vertex)"
     bl_options = {'REGISTER', 'UNDO'}
     target_index: IntProperty(default=-1)
     
@@ -1314,6 +1336,7 @@ class PINSOLVER_OT_pick_3d(PinSolverBaseOperator, PinSolverPickMixin):
         if event.type in {'LEFTMOUSE', 'MOUSE_LMB_2X'} and event.value == 'PRESS':
             self.pick_x = event.mouse_x
             self.pick_y = event.mouse_y
+            self.is_alt_pressed = event.alt
             self.pick_countdown = PinSolverConfig.PICK_DELAY_FRAMES
             return {'RUNNING_MODAL'}
             
@@ -1334,7 +1357,7 @@ class PINSOLVER_OT_pick_3d(PinSolverBaseOperator, PinSolverPickMixin):
         if not region or not rv3d: return
         origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
         direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-        hit, loc = safe_ray_cast(context, origin, direction)
+        hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=getattr(self, 'is_alt_pressed', False))
         
         if hit:
             pins, _ = get_pins(cam_data, target_data)
@@ -1417,7 +1440,7 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
             if event.type == 'A' and cam_data.ui_mode == 'LAYOUT':
                 origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
                 direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-                hit, loc = safe_ray_cast(context, origin, direction)
+                hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=event.alt)
                 if hit:
                     idx = len(pins)
                     new_pin = pins.add()
@@ -1493,7 +1516,7 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
                 elif self.dragging_type == '3D':
                     origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
                     direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-                    hit, loc = safe_ray_cast(context, origin, direction)
+                    hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=event.alt)
                     if hit: 
                         pin.pos_3d = loc
                         pin.has_valid_3d = True 
