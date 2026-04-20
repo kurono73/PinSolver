@@ -2265,22 +2265,38 @@ def draw_callback_overlay():
         else: # MATCHMOVE
             is_active = pin.use_initial
             
-        if not is_active or not pin.has_valid_3d: continue
+        if not is_active: continue
         
         p2d = get_current_pin_pos_2d(context, cam_data, pin)
-        if cam_data.ui_mode == 'MATCHMOVE' and p2d is None:
+        has_2d = (p2d is not None)
+        has_3d = pin.has_valid_3d
+        
+        if cam_data.ui_mode == 'MATCHMOVE' and not has_2d and not has_3d:
             continue
+            
+        is_selected = (i == active_idx)
         
         color = list(pin.color)
-        color[3] = (1.0 if i == active_idx else 0.5) * settings.overlay_opacity
-        
         text_color = list(settings.text_color) if settings.text_use_custom_color else list(pin.color)
-        text_color[3] = (1.0 if i == active_idx else 0.5) * settings.overlay_opacity
         
-        c2d_3dpin = location_3d_to_region_2d(region, rv3d, Vector(pin.pos_3d))
+        opacity_mult = 1.0 if is_selected else 0.5
+        
+        if not has_3d and not is_selected:
+            color = [1, 1, 1, 0.4 * settings.overlay_opacity]
+            if not settings.text_use_custom_color:
+                text_color = [1, 1, 1, 0.5 * settings.overlay_opacity]
+            else:
+                text_color[3] = 0.5 * settings.overlay_opacity
+        else:
+            color[3] = opacity_mult * settings.overlay_opacity
+            text_color[3] = opacity_mult * settings.overlay_opacity
+            
+        current_radius = int(settings.pin_radius * 1.2) if is_selected else settings.pin_radius
+        
+        c2d_3dpin = location_3d_to_region_2d(region, rv3d, Vector(pin.pos_3d)) if has_3d else None
         c2d_2dpin_display = None
 
-        if is_cam_view and cam_region and cam_rv3d:
+        if is_cam_view and cam_region and cam_rv3d and has_2d:
             if cam_data.use_distortion_overlay:
                 c2d_2dpin_display = _get_undistorted_2d_coords_cached(p2d, bounds, camintr, distcoef, res_x, res_y)
             else:
@@ -2289,12 +2305,12 @@ def draw_callback_overlay():
             
             if c2d_2dpin_display:
                 if not cam_data.is_tweak_mode or cam_data.is_edit_mode:
-                    draw_shape(c2d_2dpin_display.x, c2d_2dpin_display.y, settings.pin_radius, color, 'CIRCLE')
+                    draw_shape(c2d_2dpin_display.x, c2d_2dpin_display.y, current_radius, color, 'CIRCLE')
                     if draw_name:
                         _draw_txt(f"2D: {pin.name}", c2d_2dpin_display.x + 10, c2d_2dpin_display.y + 10, settings.text_size, text_color)
 
         if c2d_3dpin:
-            draw_shape(c2d_3dpin.x, c2d_3dpin.y, settings.pin_radius, color, 'SQUARE')
+            draw_shape(c2d_3dpin.x, c2d_3dpin.y, current_radius, color, 'SQUARE')
             if draw_name:
                 text_3d = f"3D: {pin.name}"
                 if settings.show_weight_3d and not pin.is_track_linked:
@@ -2348,9 +2364,17 @@ class PINSOLVER_UL_pins(UIList):
 
 class PINSOLVER_UL_mm_pins(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        camera = context.scene.camera
+        is_active_tracker = True
+        if camera and hasattr(camera, "pinsolver_data"):
+            cam_data = camera.pinsolver_data
+            p2d = get_current_pin_pos_2d(context, cam_data, item)
+            is_active_tracker = (p2d is not None)
+
         split_main = layout.split(factor=0.55, align=True)
         
         r_left = split_main.split(factor=0.2, align=True)
+        r_left.enabled = is_active_tracker 
         r_left.prop(item, "color", text="")
         
         r_name = r_left.row(align=True)
@@ -2359,11 +2383,14 @@ class PINSOLVER_UL_mm_pins(UIList):
         r_name.prop(item, "name", text="", emboss=False)
         
         r_right = split_main.row(align=True)
-        r_right.prop(item, "weight", text="")
+        
+        r_center = r_right.row(align=True)
+        r_center.enabled = is_active_tracker
+        r_center.prop(item, "weight", text="")
         if item.reproj_error >= 0:
-            r_right.label(text=f"{item.reproj_error:.1f}")
+            r_center.label(text=f"{item.reproj_error:.1f}")
         else:
-            r_right.label(text="")
+            r_center.label(text="")
             
         icon_str = 'HIDE_OFF' if item.use_initial else 'HIDE_ON'
         r_right.prop(item, "use_initial", text="", icon=icon_str, emboss=False)
