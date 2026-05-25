@@ -12,7 +12,8 @@ from bpy_extras.view3d_utils import region_2d_to_origin_3d, region_2d_to_vector_
 import numpy as np
 import colorsys
 import traceback
-from typing import Tuple, Optional, Any, List, Dict
+import math
+from typing import Tuple, Optional, Any, List, Dict, Set
 
 try:
     import cv2
@@ -168,6 +169,28 @@ def get_cv_camera_params(context: bpy.types.Context, cam_data: Any) -> Tuple[np.
         camintr = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
         return camintr, np.zeros(5, dtype=np.float64), res_x, res_y
 
+def sync_scene_camera_from_clip(context: bpy.types.Context, cam_data: Any) -> bool:
+    clip = cam_data.target_clip
+    camera_obj = context.scene.camera
+    if not clip or not camera_obj or not camera_obj.data:
+        return False
+        
+    trk_cam = clip.tracking.camera
+    cam_ref = camera_obj.data
+    res_x = max(1.0, float(clip.size[0]))
+    res_y = max(1.0, float(clip.size[1]))
+    max_res = max(res_x, res_y)
+    optcent = trk_cam.principal if bpy.app.version < (3, 5, 0) else trk_cam.principal_point_pixels
+    
+    try:
+        cam_ref.sensor_width = trk_cam.sensor_width
+        cam_ref.lens = trk_cam.focal_length
+        cam_ref.shift_x = (float(optcent[0]) - res_x / 2.0) / max_res
+        cam_ref.shift_y = (float(optcent[1]) - res_y / 2.0) / max_res
+        return True
+    except Exception:
+        return False
+
 def _get_undistorted_2d_coords_cached(p2d: Vector, bounds: Tuple, camintr: np.ndarray, distcoef: np.ndarray, res_x: float, res_y: float) -> Optional[Vector]:
     if not bounds or p2d is None: return None
     bounds_width = max(1e-4, bounds[2] - bounds[0])
@@ -228,6 +251,18 @@ def get_pin_pixel_coords(context: bpy.types.Context, p2d: Vector, bounds=None, r
         return (bounds[0] + p2d.x * bounds_width, bounds[1] + p2d.y * bounds_height)
     return (p2d.x * (region.width if region else 100), p2d.y * (region.height if region else 100))
 
+def get_track_marker_co(track: Any, marker: Any, cancel_offset: bool = True) -> Vector:
+    co = Vector((marker.co[0], marker.co[1]))
+    if cancel_offset:
+        try:
+            # Parent-offset trackers should solve from the parent point, not the shifted display point.
+            offset = getattr(track, "offset", None)
+            if offset is not None:
+                co += Vector((offset[0], offset[1]))
+        except Exception:
+            pass
+    return co
+
 def get_pins(cam_data: Any, target_data: Any) -> Tuple[Any, int]:
     if not cam_data or not target_data: return [], 0
     if cam_data.ui_mode == 'LAYOUT':
@@ -270,7 +305,7 @@ def get_current_pin_pos_2d(context: bpy.types.Context, cam_data: Any, pin: Any) 
                                     break
                                     
                         if marker and not getattr(marker, 'mute', False):
-                            return Vector((marker.co[0], marker.co[1]))
+                            return get_track_marker_co(track, marker)
             except: pass
         return None 
     return Vector(pin.pos_2d)
@@ -611,6 +646,64 @@ class PinSolverData(PropertyGroup):
                ('MARKERS', "Timeline Markers", "Bake only on frames that contain timeline markers")],
         default='SCENE'
     )
+    sequence_motion_source: EnumProperty(
+        name="Location Source",
+        items=[
+            ('PNP', "Solve Location", "Use PnP-derived camera location; optional filtering can repair and smooth the location path"),
+            ('EXISTING', "Existing Location", "Keep the existing animated location and run a rotation-only solve from pins"),
+            ('GUIDED', "Guided Location", "Use the existing animated camera location as a guide while still solving location from pins"),
+            ('MARKER_REFS', "Timeline Markers", "Use timeline marker camera poses as fixed references while solving the scene range")
+        ],
+        default='PNP'
+    )
+    sequence_stabilize_mode: EnumProperty(
+        name="Location Filter",
+        items=[
+            ('OFF', "Off", "Use direct PnP location and rotation without curve repair"),
+            ('AUTO', "Smooth", "Use guided PnP, repair location outliers, smooth location, then refit rotation"),
+            ('STRONG', "Hyper Smooth", "Use stronger location repair and smoothing for difficult tracker layouts")
+        ],
+        default='OFF'
+    )
+    sequence_location_filter_strength: FloatProperty(
+        name="Location Strength",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        soft_min=0.0,
+        soft_max=2.0,
+        subtype='FACTOR',
+        description="Adjust the strength of the selected location filter mode"
+    )
+    sequence_guided_location_strength: FloatProperty(
+        name="Guide Strength",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        soft_min=0.0,
+        soft_max=2.0,
+        subtype='FACTOR',
+        description="Adjust how strongly Guided Location follows the existing camera location curve"
+    )
+    sequence_roll_smoothing: EnumProperty(
+        name="Roll Smoothing",
+        items=[
+            ('OFF', "Off", "Keep solved roll as-is"),
+            ('SMOOTH', "Smooth", "Smooth camera roll while keeping the solved viewing direction"),
+            ('HYPER', "Hyper Smooth", "Apply stronger camera roll smoothing for one-sided tracker layouts")
+        ],
+        default='OFF'
+    )
+    sequence_roll_smoothing_strength: FloatProperty(
+        name="Roll Strength",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        soft_min=0.0,
+        soft_max=2.0,
+        subtype='FACTOR',
+        description="Adjust the strength of the selected roll smoothing mode"
+    )
     
     solve_mode: EnumProperty(
         name="Solve Target",
@@ -625,6 +718,7 @@ class PinSolverData(PropertyGroup):
     active_target_index: IntProperty(default=0)
     
     show_pin_details: BoolProperty(name="Manual Coordinates", default=False, description="Expand to manually edit 2D and 3D coordinates") 
+    show_sequence_options: BoolProperty(name="Options", default=True, description="Expand sequence solver options")
     show_calibration: BoolProperty(name="Lens Calibration", default=False, description="Expand Lens Calibration settings") 
     show_settings: BoolProperty(name="PinSolver Settings", default=False, description="Expand to change appearance and behaviors") 
     
@@ -757,9 +851,6 @@ def _prep_multi_pin_data(valid_pins: List[Any], valid_p2ds: List[Vector], res_x:
         P3_3d = P1 + cam_right * dist
         P4_3d = P1 + cam_up * dist
         
-        P_cam3 = cam_mat_unscaled.inverted() @ P3_3d
-        P_cam4 = cam_mat_unscaled.inverted() @ P4_3d
-        
         virt_3d = np.array([list(P3_3d), list(P4_3d)], dtype=np.float64)
         virt_2d, _ = cv2.projectPoints(virt_3d, rvec_guess, tvec_guess, camintr, distcoef)
         solve_obj_pts.extend([list(P3_3d), list(P4_3d)])
@@ -839,30 +930,36 @@ def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[An
         traceback.print_exc()
         return camintr, distcoef, None, None, False, f"Unexpected Calib Error: {type(e).__name__}"
 
-def _estimate_pose(obj_pts: np.ndarray, img_pts: np.ndarray, camintr: np.ndarray, distcoef: np.ndarray, rvec_guess: np.ndarray, tvec_guess: np.ndarray, use_guess: bool, fallback_rvec: np.ndarray = None, fallback_tvec: np.ndarray = None, use_planar: bool = False) -> Tuple[bool, Optional[Matrix], str]:
+def _estimate_pose(obj_pts: np.ndarray, img_pts: np.ndarray, camintr: np.ndarray, distcoef: np.ndarray, rvec_guess: np.ndarray, tvec_guess: np.ndarray, use_guess: bool, fallback_rvec: np.ndarray = None, fallback_tvec: np.ndarray = None, use_planar: bool = False, allow_global_fallback: bool = True) -> Tuple[bool, Optional[Matrix], str]:
     pnp_success = False
     rvec_out = np.copy(rvec_guess)
     tvec_out = np.copy(tvec_guess)
     error_msg = ""
     
-    if use_planar and hasattr(cv2, 'SOLVEPNP_IPPE') and len(obj_pts) >= 4:
+    if use_guess:
         try:
             pnp_success, rvec_out, tvec_out = cv2.solvePnP(
-                obj_pts, img_pts, camintr, distcoef, flags=cv2.SOLVEPNP_IPPE)
+                obj_pts, img_pts, camintr, distcoef, 
+                rvec=rvec_out, tvec=tvec_out, 
+                useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+            if pnp_success and hasattr(cv2, 'solvePnPRefineLM'):
+                rvec_out, tvec_out = cv2.solvePnPRefineLM(obj_pts, img_pts, camintr, distcoef, rvec_out, tvec_out)
         except cv2.error as e:
-            error_msg = f"Planar PnP Error: {str(e).splitlines()[0][:40]}"
+            error_msg = f"Guided PnP Error: {str(e).splitlines()[0][:40]}"
+            pnp_success = False
         except Exception as e:
-            error_msg = f"Unexpected Planar Error: {type(e).__name__}"
-            
-    if not pnp_success:
-        if use_guess:
+            error_msg = f"Unexpected Guided Error: {type(e).__name__}"
+            pnp_success = False
+
+    if not pnp_success and allow_global_fallback:
+        if use_planar and hasattr(cv2, 'SOLVEPNP_IPPE') and len(obj_pts) >= 4:
             try:
                 pnp_success, rvec_out, tvec_out = cv2.solvePnP(
-                    obj_pts, img_pts, camintr, distcoef, 
-                    rvec=rvec_out, tvec=tvec_out, 
-                    useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
-            except Exception:
-                pnp_success = False
+                    obj_pts, img_pts, camintr, distcoef, flags=cv2.SOLVEPNP_IPPE)
+            except cv2.error as e:
+                error_msg = f"Planar PnP Error: {str(e).splitlines()[0][:40]}"
+            except Exception as e:
+                error_msg = f"Unexpected Planar Error: {type(e).__name__}"
                 
         if not use_guess or not pnp_success:
             try:
@@ -896,7 +993,710 @@ def _estimate_pose(obj_pts: np.ndarray, img_pts: np.ndarray, camintr: np.ndarray
     mat_loc = Matrix.Translation(Vector((cam_pos[0], cam_pos[1], cam_pos[2])))
     return True, mat_loc @ Matrix(R_blender).to_4x4(), ""
 
-def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_mode: str = 'initial', skip_calib: bool = False) -> Tuple[bool, Optional[Matrix]]:
+def get_camera_unscaled_matrix(camera_obj: bpy.types.Object, depsgraph: Any = None) -> Matrix:
+    eval_cam = camera_obj.evaluated_get(depsgraph) if depsgraph else camera_obj
+    cam_loc, cam_rot, _ = eval_cam.matrix_world.decompose()
+    return Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
+
+def interpolate_pose_matrices(a: Matrix, b: Matrix, factor: float) -> Matrix:
+    factor = max(0.0, min(1.0, float(factor)))
+    loc_a, rot_a, scale_a = a.decompose()
+    loc_b, rot_b, _ = b.decompose()
+    return Matrix.LocRotScale(loc_a.lerp(loc_b, factor), rot_a.slerp(rot_b, factor), scale_a)
+
+def extrapolate_location_pose(previous_pose: Matrix, previous_frame: int, current_pose: Matrix, current_frame: int, target_frame: int, older_pose: Matrix = None, older_frame: int = None, use_acceleration: bool = False) -> Matrix:
+    if previous_pose is None or current_pose is None or previous_frame == current_frame:
+        return current_pose.copy() if current_pose else None
+        
+    prev_loc, _, _ = previous_pose.decompose()
+    curr_loc, curr_rot, curr_scale = current_pose.decompose()
+    factor = (target_frame - current_frame) / max(1.0, abs(current_frame - previous_frame))
+    current_step = curr_loc - prev_loc
+    predicted_loc = curr_loc + current_step * factor
+    
+    if use_acceleration and older_pose is not None and older_frame is not None and previous_frame != older_frame:
+        older_loc, _, _ = older_pose.decompose()
+        previous_step = prev_loc - older_loc
+        accel_adjust = (current_step - previous_step) * factor * 0.5
+        max_adjust = max(0.0, current_step.length * 0.75)
+        if accel_adjust.length > max_adjust > 1e-8:
+            accel_adjust = accel_adjust.normalized() * max_adjust
+        predicted_loc += accel_adjust
+        
+    return Matrix.LocRotScale(predicted_loc, curr_rot, curr_scale)
+
+def get_pose_delta(a: Matrix, b: Matrix) -> Tuple[float, float]:
+    loc_a, rot_a, _ = a.decompose()
+    loc_b, rot_b, _ = b.decompose()
+    return (loc_b - loc_a).length, rot_a.rotation_difference(rot_b).angle
+
+def get_roll_basis(forward: Vector) -> Tuple[Vector, Vector]:
+    fwd = forward.normalized()
+    world_up = Vector((0.0, 0.0, 1.0))
+    if abs(fwd.dot(world_up)) > 0.98:
+        world_up = Vector((0.0, 1.0, 0.0))
+    right = fwd.cross(world_up).normalized()
+    up = right.cross(fwd).normalized()
+    return right, up
+
+def pose_roll_angle(pose: Matrix) -> Tuple[float, Vector, Vector, Vector]:
+    rot_mat = pose.to_3x3()
+    forward = (rot_mat @ Vector((0.0, 0.0, -1.0))).normalized()
+    up = (rot_mat @ Vector((0.0, 1.0, 0.0))).normalized()
+    base_right, base_up = get_roll_basis(forward)
+    angle = float(np.arctan2(up.dot(base_right), up.dot(base_up)))
+    return angle, forward, base_right, base_up
+
+def matrix_with_roll(pose: Matrix, roll_angle: float) -> Matrix:
+    loc, _, scale = pose.decompose()
+    _, forward, base_right, base_up = pose_roll_angle(pose)
+    up = (math.cos(roll_angle) * base_up + math.sin(roll_angle) * base_right).normalized()
+    right = forward.cross(up).normalized()
+    up = right.cross(forward).normalized()
+    back = -forward
+    rot = Matrix((
+        (right.x, up.x, back.x),
+        (right.y, up.y, back.y),
+        (right.z, up.z, back.z),
+    ))
+    return Matrix.LocRotScale(loc, rot.to_quaternion(), scale)
+
+def repair_roll_curve(unwrapped: np.ndarray, mode: str, reference_index: int, strength_factor: float) -> np.ndarray:
+    if len(unwrapped) < 5:
+        return np.array(unwrapped, dtype=np.float64, copy=True)
+        
+    strength_factor = max(0.0, min(2.0, float(strength_factor)))
+    repaired = np.array(unwrapped, dtype=np.float64, copy=True)
+    radius = 4 if mode == 'HYPER' else 3
+    min_threshold = math.radians(6.0 if mode == 'HYPER' else 10.0)
+    strength = min(0.95, (0.75 if mode == 'HYPER' else 0.55) * strength_factor)
+    
+    for _ in range(2):
+        previous = repaired.copy()
+        for i in range(len(previous)):
+            if i == reference_index:
+                continue
+                
+            lo = max(0, i - radius)
+            hi = min(len(previous), i + radius + 1)
+            samples = [previous[j] for j in range(lo, hi) if j != i]
+            if len(samples) < 2:
+                continue
+                
+            sample_arr = np.array(samples, dtype=np.float64)
+            median = float(np.median(sample_arr))
+            mad = float(np.median(np.abs(sample_arr - median)))
+            threshold = max(min_threshold, mad * 1.4826 * 3.0)
+            residual = previous[i] - median
+            if abs(residual) > threshold:
+                repaired[i] = previous[i] * (1.0 - strength) + median * strength
+                
+    return repaired
+
+def stabilize_roll_pose_path(solved_pose_by_frame: Dict[int, Matrix], mode: str, reference_frame: int, strength_factor: float = 1.0, fixed_frames: Optional[Set[int]] = None) -> Dict[int, Matrix]:
+    if mode == 'OFF' or len(solved_pose_by_frame) < 3:
+        return {}
+        
+    fixed_frames = fixed_frames or {reference_frame}
+    strength_factor = max(0.0, min(2.0, float(strength_factor)))
+    frames = sorted(solved_pose_by_frame.keys())
+    rolls = []
+    for f in frames:
+        angle, _, _, _ = pose_roll_angle(solved_pose_by_frame[f])
+        rolls.append(angle)
+        
+    unwrapped = np.unwrap(np.array(rolls, dtype=np.float64))
+    reference_index = frames.index(reference_frame) if reference_frame in frames else -1
+    repaired = repair_roll_curve(unwrapped, mode, reference_index, strength_factor)
+    if mode == 'HYPER':
+        radius = 6
+        blend = min(0.98, 0.85 * strength_factor)
+    else:
+        radius = 3
+        blend = min(0.98, 0.55 * strength_factor)
+        
+    smoothed = []
+    for i in range(len(frames)):
+        weighted = 0.0
+        weight_sum = 0.0
+        for j in range(max(0, i - radius), min(len(frames), i + radius + 1)):
+            dist = abs(j - i)
+            weight = (radius + 1 - dist) / (radius + 1)
+            weighted += repaired[j] * weight
+            weight_sum += weight
+        smoothed.append(weighted / max(weight_sum, 1e-8))
+        
+    if reference_index >= 0:
+        ref_delta = smoothed[reference_index] - unwrapped[reference_index]
+        smoothed = [roll - ref_delta for roll in smoothed]
+        
+    result = {}
+    for f, raw_roll, repaired_roll, smooth_roll in zip(frames, unwrapped, repaired, smoothed):
+        if f in fixed_frames:
+            continue
+        final_roll = repaired_roll * (1.0 - blend) + smooth_roll * blend
+        result[f] = matrix_with_roll(solved_pose_by_frame[f], final_roll)
+    return result
+
+def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condition_by_frame: Dict[int, float], pin_count_by_frame: Dict[int, int], mode: str, strength_factor: float = 1.0, hard_frames: Optional[Set[int]] = None, soft_anchor_pose_by_frame: Optional[Dict[int, Matrix]] = None) -> Dict[int, Matrix]:
+    if mode == 'OFF' or len(solved_pose_by_frame) < 3:
+        return {}
+        
+    strength_factor = max(0.0, min(2.0, float(strength_factor)))
+    if strength_factor <= 1e-6:
+        return {}
+        
+    hard_frames = hard_frames or set()
+    soft_anchor_pose_by_frame = soft_anchor_pose_by_frame or {}
+    frames = sorted(solved_pose_by_frame.keys())
+    loc_by_frame = {}
+    rot_by_frame = {}
+    scale_by_frame = {}
+    for f in frames:
+        loc, rot, scale = solved_pose_by_frame[f].decompose()
+        loc_by_frame[f] = loc
+        rot_by_frame[f] = rot
+        scale_by_frame[f] = scale
+    soft_anchor_loc_by_frame = {
+        f: pose.decompose()[0]
+        for f, pose in soft_anchor_pose_by_frame.items()
+        if f in loc_by_frame and f not in hard_frames and pose is not None
+    }
+        
+    step_lengths = []
+    for a, b in zip(frames[:-1], frames[1:]):
+        dt = max(1.0, float(b - a))
+        step_lengths.append((loc_by_frame[b] - loc_by_frame[a]).length / dt)
+    step_med = float(np.median(step_lengths)) if step_lengths else 0.0
+    step_med = max(step_med, 1e-6)
+    
+    residuals = {}
+    for i in range(1, len(frames) - 1):
+        f = frames[i]
+        prev_f = frames[i - 1]
+        next_f = frames[i + 1]
+        factor = (f - prev_f) / max(1.0, next_f - prev_f)
+        expected = loc_by_frame[prev_f].lerp(loc_by_frame[next_f], factor)
+        residuals[f] = (loc_by_frame[f] - expected).length
+        
+    if residuals:
+        vals = np.array(list(residuals.values()), dtype=np.float64)
+        resid_med = float(np.median(vals))
+        resid_mad = float(np.median(np.abs(vals - resid_med)))
+    else:
+        resid_med = 0.0
+        resid_mad = 0.0
+        
+    if mode == 'STRONG':
+        resid_limit = max(step_med * 3.0, resid_med + resid_mad * 4.0)
+        low_cond_limit = max(step_med * 1.8, resid_med + resid_mad * 2.5)
+        jump_limit = step_med * 5.0
+        radius = 5
+        base_strength = 0.75
+    else:
+        resid_limit = max(step_med * 5.0, resid_med + resid_mad * 6.0)
+        low_cond_limit = max(step_med * 3.0, resid_med + resid_mad * 4.0)
+        jump_limit = step_med * 8.0
+        radius = 3
+        base_strength = 0.45
+        
+    outliers = set()
+    for i in range(1, len(frames) - 1):
+        f = frames[i]
+        if f in hard_frames:
+            continue
+        prev_f = frames[i - 1]
+        next_f = frames[i + 1]
+        condition = condition_by_frame.get(f, 1.0)
+        pin_count = pin_count_by_frame.get(f, 0)
+        low_condition = condition >= 0.45 or pin_count < 5
+        residual = residuals.get(f, 0.0)
+        if residual > resid_limit or (low_condition and residual > low_cond_limit):
+            outliers.add(f)
+            continue
+            
+        prev_step = (loc_by_frame[f] - loc_by_frame[prev_f]).length / max(1.0, f - prev_f)
+        next_step = (loc_by_frame[next_f] - loc_by_frame[f]).length / max(1.0, next_f - f)
+        across_step = (loc_by_frame[next_f] - loc_by_frame[prev_f]).length / max(1.0, next_f - prev_f)
+        if low_condition and prev_step > jump_limit and next_step > jump_limit and across_step < max(prev_step, next_step) * 0.35:
+            outliers.add(f)
+    
+    good_frames = [f for f in frames if f not in outliers]
+    repaired_loc = dict(loc_by_frame)
+    for f in sorted(outliers):
+        prev_good = [gf for gf in good_frames if gf < f]
+        next_good = [gf for gf in good_frames if gf > f]
+        if prev_good and next_good:
+            a = max(prev_good)
+            b = min(next_good)
+            factor = (f - a) / max(1.0, b - a)
+            repaired_loc[f] = repaired_loc[a].lerp(repaired_loc[b], factor)
+        elif prev_good:
+            repaired_loc[f] = repaired_loc[max(prev_good)].copy()
+        elif next_good:
+            repaired_loc[f] = repaired_loc[min(next_good)].copy()
+    
+    stabilized = {}
+    for i, f in enumerate(frames):
+        weighted = Vector((0.0, 0.0, 0.0))
+        weight_sum = 0.0
+        for j in range(max(0, i - radius), min(len(frames), i + radius + 1)):
+            nf = frames[j]
+            dist = abs(j - i)
+            weight = (radius + 1 - dist) / (radius + 1)
+            weighted += repaired_loc[nf] * weight
+            weight_sum += weight
+        if weight_sum <= 1e-8:
+            continue
+        avg_loc = weighted / weight_sum
+        if f in hard_frames:
+            final_loc = loc_by_frame[f]
+        else:
+            condition = condition_by_frame.get(f, 0.0)
+            strength = min(0.98, (base_strength + condition * (0.2 if mode == 'STRONG' else 0.15)) * strength_factor)
+            final_loc = repaired_loc[f].lerp(avg_loc, min(1.0, strength_factor)) if f in outliers else repaired_loc[f].lerp(avg_loc, strength)
+            if f in soft_anchor_loc_by_frame:
+                anchor_strength = min(0.90, (0.70 if mode == 'STRONG' else 0.55) * strength_factor)
+                final_loc = final_loc.lerp(soft_anchor_loc_by_frame[f], anchor_strength)
+        stabilized[f] = Matrix.LocRotScale(final_loc, rot_by_frame[f], scale_by_frame[f])
+        
+    return stabilized
+
+def align_marker_reference_segments(solved_pose_by_frame: Dict[int, Matrix], marker_reference_pose_by_frame: Dict[int, Matrix], anchor_frames: Set[int]) -> Dict[int, Matrix]:
+    anchors = sorted(f for f in anchor_frames if f in solved_pose_by_frame and f in marker_reference_pose_by_frame)
+    if not anchors:
+        return {}
+        
+    aligned = {}
+    solved_frames = sorted(solved_pose_by_frame.keys())
+    anchor_offsets = {}
+    for f in anchors:
+        solved_loc, _, _ = solved_pose_by_frame[f].decompose()
+        marker_loc, _, _ = marker_reference_pose_by_frame[f].decompose()
+        anchor_offsets[f] = marker_loc - solved_loc
+        aligned[f] = marker_reference_pose_by_frame[f].copy()
+        
+    if len(anchors) < 2:
+        return aligned
+        
+    for left_f, right_f in zip(anchors[:-1], anchors[1:]):
+        span = max(1.0, float(right_f - left_f))
+        for f in sorted(frame for frame in solved_pose_by_frame.keys() if left_f < frame < right_f):
+            factor = (f - left_f) / span
+            smooth_factor = factor * factor * (3.0 - 2.0 * factor)
+            base_pose = solved_pose_by_frame[f]
+            base_loc, base_rot, base_scale = base_pose.decompose()
+            offset = anchor_offsets[left_f].lerp(anchor_offsets[right_f], smooth_factor)
+            final_loc = base_loc + offset
+            aligned[f] = Matrix.LocRotScale(final_loc, base_rot, base_scale)
+            
+    first_anchor = anchors[0]
+    last_anchor = anchors[-1]
+    for f in solved_frames:
+        if f in aligned:
+            continue
+        base_pose = solved_pose_by_frame[f]
+        base_loc, base_rot, base_scale = base_pose.decompose()
+        if f < first_anchor:
+            aligned[f] = Matrix.LocRotScale(base_loc + anchor_offsets[first_anchor], base_rot, base_scale)
+        elif f > last_anchor:
+            aligned[f] = Matrix.LocRotScale(base_loc + anchor_offsets[last_anchor], base_rot, base_scale)
+    return aligned
+
+def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix], fixed_frames: Set[int], mode: str, strength_factor: float = 1.0) -> Dict[int, Matrix]:
+    fixed_frames = {f for f in fixed_frames if f in solved_pose_by_frame}
+    if len(solved_pose_by_frame) < 3 or not fixed_frames:
+        return {}
+        
+    frames = sorted(solved_pose_by_frame.keys())
+    frame_set = set(frames)
+    fixed_sorted = sorted(fixed_frames)
+    strength_factor = max(0.0, min(2.0, float(strength_factor)))
+    radius = 12 if mode == 'STRONG' else 7
+    blend = min(1.0, (0.96 if mode == 'STRONG' else 0.86) * strength_factor)
+    if blend <= 1e-6:
+        return {}
+        
+    reinforced = {}
+    
+    def hermite(p0: Vector, p1: Vector, m0: Vector, m1: Vector, t: float) -> Vector:
+        t = max(0.0, min(1.0, float(t)))
+        t2 = t * t
+        t3 = t2 * t
+        h00 = 2.0 * t3 - 3.0 * t2 + 1.0
+        h10 = t3 - 2.0 * t2 + t
+        h01 = -2.0 * t3 + 3.0 * t2
+        h11 = t3 - t2
+        return p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11
+    
+    def collect_side(anchor_f: int, anchor_index: int, direction: int) -> List[int]:
+        side_indices = []
+        idx = anchor_index + direction
+        while 0 <= idx < len(frames):
+            f = frames[idx]
+            if f in fixed_frames:
+                break
+            if abs(f - anchor_f) > radius:
+                break
+            side_indices.append(idx)
+            idx += direction
+        return side_indices
+    
+    def apply_side(anchor_f: int, side_indices: List[int], boundary_f: int, anchor_tangent_per_frame: Vector, boundary_tangent_scale: float):
+        if not side_indices:
+            return
+        anchor_loc, _, _ = solved_pose_by_frame[anchor_f].decompose()
+        boundary_loc, _, _ = solved_pose_by_frame[boundary_f].decompose()
+        span = max(1.0, abs(boundary_f - anchor_f))
+        direction = 1 if boundary_f > anchor_f else -1
+        if direction > 0:
+            p0 = anchor_loc
+            p1 = boundary_loc
+            m0 = anchor_tangent_per_frame * span
+            m1 = (boundary_loc - anchor_loc) * boundary_tangent_scale
+        else:
+            p0 = boundary_loc
+            p1 = anchor_loc
+            m0 = (anchor_loc - boundary_loc) * boundary_tangent_scale
+            m1 = anchor_tangent_per_frame * span
+        for i in side_indices:
+            f = frames[i]
+            if f not in frame_set or f in fixed_frames:
+                continue
+            if direction > 0:
+                factor = (f - anchor_f) / span
+            else:
+                factor = (f - boundary_f) / span
+            target_loc = hermite(p0, p1, m0, m1, factor)
+            base_loc, base_rot, base_scale = solved_pose_by_frame[f].decompose()
+            distance_from_anchor = abs(f - anchor_f) / span
+            distance_weight = 1.0 - min(1.0, distance_from_anchor)
+            local_blend = min(1.0, blend * (0.82 + 0.18 * distance_weight))
+            final_loc = target_loc if local_blend >= 0.999 else base_loc.lerp(target_loc, local_blend)
+            reinforced[f] = Matrix.LocRotScale(final_loc, base_rot, base_scale)
+    
+    for anchor_f in fixed_sorted:
+        anchor_index = frames.index(anchor_f)
+        left_indices = collect_side(anchor_f, anchor_index, -1)
+        right_indices = collect_side(anchor_f, anchor_index, 1)
+        if not left_indices and not right_indices:
+            continue
+            
+        left_boundary_f = frames[left_indices[-1]] if left_indices else None
+        right_boundary_f = frames[right_indices[-1]] if right_indices else None
+        anchor_loc, _, _ = solved_pose_by_frame[anchor_f].decompose()
+        
+        if left_boundary_f is not None and right_boundary_f is not None:
+            left_loc, _, _ = solved_pose_by_frame[left_boundary_f].decompose()
+            right_loc, _, _ = solved_pose_by_frame[right_boundary_f].decompose()
+            anchor_tangent = (right_loc - left_loc) / max(1.0, float(right_boundary_f - left_boundary_f))
+        elif left_boundary_f is not None:
+            left_loc, _, _ = solved_pose_by_frame[left_boundary_f].decompose()
+            anchor_tangent = (anchor_loc - left_loc) / max(1.0, float(anchor_f - left_boundary_f))
+        else:
+            right_loc, _, _ = solved_pose_by_frame[right_boundary_f].decompose()
+            anchor_tangent = (right_loc - anchor_loc) / max(1.0, float(right_boundary_f - anchor_f))
+        anchor_tangent *= 0.18 if mode == 'STRONG' else 0.28
+        boundary_tangent_scale = 0.35 if mode == 'STRONG' else 0.50
+        
+        if left_boundary_f is not None:
+            apply_side(anchor_f, left_indices, left_boundary_f, anchor_tangent, boundary_tangent_scale)
+        if right_boundary_f is not None:
+            apply_side(anchor_f, right_indices, right_boundary_f, anchor_tangent, boundary_tangent_scale)
+            
+    return reinforced
+
+def smooth_guided_location_pose(pose: Matrix, guide_location: Vector, strength_factor: float) -> Matrix:
+    if pose is None or guide_location is None:
+        return pose
+    strength_factor = max(0.0, min(2.0, float(strength_factor)))
+    if strength_factor <= 1e-6:
+        return pose
+    loc, rot, scale = pose.decompose()
+    blend = min(0.85, 0.42 * strength_factor)
+    return Matrix.LocRotScale(loc.lerp(guide_location, blend), rot, scale)
+
+def refine_rotation_for_fixed_location(context: bpy.types.Context, cam_data: Any, target_data: Any, base_pose: Matrix) -> Matrix:
+    if base_pose is None:
+        return base_pose
+        
+    pins, _ = get_pins(cam_data, target_data)
+    world_dirs = []
+    camera_rays = []
+    weights = []
+    camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
+    loc, rot, scale = base_pose.decompose()
+    
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        p2d = get_current_pin_pos_2d(context, cam_data, pin)
+        if p2d is None:
+            continue
+            
+        world_vec = Vector(pin.pos_3d) - loc
+        if world_vec.length < 1e-6:
+            continue
+        world_dirs.append(np.array(world_vec.normalized(), dtype=np.float64))
+        
+        px, py = to_cv_pixel(p2d.x, p2d.y, res_x, res_y)
+        has_distortion = HAS_OPENCV and np.linalg.norm(distcoef) > 1e-8
+        if has_distortion:
+            pt = np.array([[[px, py]]], dtype=np.float64)
+            undist = cv2.undistortPoints(pt, camintr, distcoef)
+            x = float(undist[0][0][0])
+            y = float(undist[0][0][1])
+        else:
+            x = (px - camintr[0, 2]) / max(1e-8, camintr[0, 0])
+            y = (py - camintr[1, 2]) / max(1e-8, camintr[1, 1])
+        ray = Vector((x, y, 1.0)).normalized()
+        camera_rays.append(np.array(ray, dtype=np.float64))
+        weights.append(1.0 + float(getattr(pin, "weight", 0.0)) * 4.0)
+        
+    if len(world_dirs) < 2:
+        return base_pose
+        
+    cam_mat_unscaled = Matrix.LocRotScale(loc, rot, Vector((1.0, 1.0, 1.0)))
+    R_bcam2cv = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float64)
+    R_base_world2bcam = np.array(cam_mat_unscaled.to_3x3().transposed(), dtype=np.float64)
+    R_base_world2cv = R_bcam2cv @ R_base_world2bcam
+    
+    H = np.zeros((3, 3), dtype=np.float64)
+    for src_world, dst_ray, weight in zip(world_dirs, camera_rays, weights):
+        H += weight * np.outer(dst_ray, src_world)
+        
+    try:
+        U, _, Vt = np.linalg.svd(H)
+        R_world2cv = U @ Vt
+        if np.linalg.det(R_world2cv) < 0.0:
+            U[:, -1] *= -1.0
+            R_world2cv = U @ Vt
+    except Exception:
+        return base_pose
+        
+    def angular_error(R):
+        total = 0.0
+        wsum = 0.0
+        for src_world, dst_ray, weight in zip(world_dirs, camera_rays, weights):
+            pred = R @ src_world
+            dot = float(np.clip(np.dot(pred, dst_ray), -1.0, 1.0))
+            total += np.arccos(dot) * weight
+            wsum += weight
+        return total / max(wsum, 1e-8)
+    
+    base_err = angular_error(R_base_world2cv)
+    cand_err = angular_error(R_world2cv)
+    R_delta = R_world2cv @ R_base_world2cv.T
+    delta_angle = float(np.arccos(np.clip((np.trace(R_delta) - 1.0) * 0.5, -1.0, 1.0)))
+    
+    if cand_err > base_err + np.deg2rad(0.25):
+        return base_pose
+    if delta_angle > np.deg2rad(45.0) and cand_err > base_err * 0.7:
+        return base_pose
+    
+    R_cv2world = R_world2cv.T
+    R_blender = np.dot(R_cv2world, R_bcam2cv)
+    return Matrix.Translation(loc) @ Matrix(R_blender).to_4x4()
+
+def get_solve_condition_score(context: bpy.types.Context, cam_data: Any, target_data: Any) -> Tuple[float, int]:
+    pins, _ = get_pins(cam_data, target_data)
+    pts = []
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        p2d = get_current_pin_pos_2d(context, cam_data, pin)
+        if p2d is not None:
+            pts.append((float(p2d.x), float(p2d.y)))
+            
+    count = len(pts)
+    if count < 3:
+        return 1.0, count
+        
+    arr = np.array(pts, dtype=np.float64)
+    span = np.maximum(np.max(arr, axis=0) - np.min(arr, axis=0), 0.0)
+    bbox_area = float(span[0] * span[1])
+    coverage_bad = 1.0 - min(1.0, bbox_area / 0.12)
+    
+    centroid = np.mean(arr, axis=0)
+    center_dist = float(np.linalg.norm(centroid - np.array([0.5, 0.5], dtype=np.float64)))
+    one_sided_bad = min(1.0, max(0.0, (center_dist - 0.18) / 0.35))
+    
+    centered = arr - centroid
+    line_bad = 0.0
+    try:
+        cov = np.cov(centered.T)
+        eig_vals = np.maximum(np.linalg.eigvalsh(cov), 0.0)
+        if eig_vals[1] > 1e-8:
+            ratio = eig_vals[0] / eig_vals[1]
+            line_bad = min(1.0, max(0.0, (0.12 - ratio) / 0.12))
+        else:
+            line_bad = 1.0
+    except Exception:
+        line_bad = 1.0
+    
+    count_bad = max(0.0, (5.0 - count) / 2.0)
+    return max(coverage_bad, one_sided_bad, line_bad, min(1.0, count_bad)), count
+
+def restore_sequence_pin_positions(context: bpy.types.Context, cam_data: Any, target_obj: bpy.types.Object, pins: Any, ref_3d_pos: Dict[str, Vector], ref_local_pos: Dict[str, Vector]) -> None:
+    if cam_data.solve_mode == 'OBJECT':
+        depsgraph = context.evaluated_depsgraph_get()
+        tgt_mat = target_obj.evaluated_get(depsgraph).matrix_world if target_obj else Matrix.Identity(4)
+        for p in pins:
+            p.pos_3d = tgt_mat @ ref_local_pos[p.name]
+    else:
+        for p in pins:
+            p.pos_3d = ref_3d_pos[p.name]
+
+def replace_pose_location(pose: Matrix, location: Vector) -> Matrix:
+    _, rot, scale = pose.decompose()
+    return Matrix.LocRotScale(location, rot, scale)
+
+def pose_reprojection_error(context: bpy.types.Context, cam_data: Any, target_data: Any, pose: Matrix) -> float:
+    if pose is None or not HAS_OPENCV:
+        return float("inf")
+        
+    pins, _ = get_pins(cam_data, target_data)
+    obj_pts = []
+    img_pts = []
+    camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        p2d = get_current_pin_pos_2d(context, cam_data, pin)
+        if p2d is None:
+            continue
+        obj_pts.append(list(Vector(pin.pos_3d)))
+        img_pts.append(to_cv_pixel(p2d.x, p2d.y, res_x, res_y))
+        
+    if not obj_pts:
+        return float("inf")
+        
+    try:
+        R_bcam2cv = np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float64)
+        R_world2bcam = np.array(pose.to_3x3().transposed(), dtype=np.float64)
+        R_world2cv = R_bcam2cv @ R_world2bcam
+        rvec, _ = cv2.Rodrigues(R_world2cv)
+        tvec = -R_world2cv @ np.array(pose.translation, dtype=np.float64)
+        proj_pts, _ = cv2.projectPoints(np.array(obj_pts, dtype=np.float64), rvec, tvec.reshape(3, 1), camintr, distcoef)
+        errors = []
+        for proj, img in zip(proj_pts.reshape(-1, 2), img_pts):
+            errors.append(float(np.linalg.norm(proj - np.array(img, dtype=np.float64))))
+        return float(np.mean(errors)) if errors else float("inf")
+    except Exception:
+        return float("inf")
+
+def get_active_pin_world_points(context: bpy.types.Context, cam_data: Any, target_data: Any) -> List[Vector]:
+    pins, _ = get_pins(cam_data, target_data)
+    points = []
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        if get_current_pin_pos_2d(context, cam_data, pin) is None:
+            continue
+        points.append(Vector(pin.pos_3d))
+    return points
+
+def get_pin_plane_hint(points: List[Vector]) -> Tuple[Optional[Vector], Optional[Vector], bool]:
+    if len(points) < 3:
+        return None, None, False
+        
+    centroid = sum(points, Vector((0.0, 0.0, 0.0))) / len(points)
+    arr = np.array([list(p - centroid) for p in points], dtype=np.float64)
+    try:
+        _, s, vh = np.linalg.svd(arr, full_matrices=False)
+        if len(s) < 3:
+            return centroid, None, False
+        normal = Vector(vh[-1]).normalized()
+        planar = float(s[-1]) <= max(1e-5, float(s[0]) * 0.025)
+        return centroid, normal, planar
+    except Exception:
+        return centroid, None, False
+
+def pose_forward_vector(pose: Matrix) -> Vector:
+    return (pose.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
+
+def view_direction_to_points(pose: Matrix, centroid: Vector) -> Optional[Vector]:
+    loc = pose.translation
+    vec = centroid - loc
+    if vec.length < 1e-8:
+        return None
+    return vec.normalized()
+
+def pose_flip_penalty(pose: Matrix, reference_pose: Matrix, points: List[Vector], centroid: Vector, plane_normal: Optional[Vector], is_planar: bool, low_condition: bool) -> float:
+    if pose is None or reference_pose is None or not points:
+        return 0.0
+        
+    penalty = 0.0
+    forward = pose_forward_vector(pose)
+    ref_forward = pose_forward_vector(reference_pose)
+    loc = pose.translation
+    
+    behind_count = 0
+    for p in points:
+        if (p - loc).dot(forward) <= 1e-5:
+            behind_count += 1
+    if behind_count:
+        penalty += 1000.0 + behind_count * 250.0
+        
+    forward_angle = ref_forward.angle(forward, 0.0)
+    forward_limit = np.deg2rad(18.0 if (low_condition or is_planar) else 35.0)
+    if forward_angle > forward_limit:
+        penalty += (forward_angle - forward_limit) * (70.0 if (low_condition or is_planar) else 20.0)
+        
+    ref_view = view_direction_to_points(reference_pose, centroid)
+    cand_view = view_direction_to_points(pose, centroid)
+    if ref_view is not None and cand_view is not None:
+        view_angle = ref_view.angle(cand_view, 0.0)
+        view_limit = np.deg2rad(24.0 if (low_condition or is_planar) else 45.0)
+        if view_angle > view_limit:
+            penalty += (view_angle - view_limit) * (65.0 if (low_condition or is_planar) else 18.0)
+            
+    if is_planar and plane_normal is not None:
+        ref_side = (reference_pose.translation - centroid).dot(plane_normal)
+        cand_side = (pose.translation - centroid).dot(plane_normal)
+        if abs(ref_side) > 1e-6 and abs(cand_side) > 1e-6 and ref_side * cand_side < 0.0:
+            penalty += 1500.0
+        if abs(ref_side) > 1e-6 and abs(cand_side) > 1e-6:
+            dist_ratio = abs(cand_side) / max(abs(ref_side), 1e-6)
+            if dist_ratio > 1.8:
+                penalty += (dist_ratio - 1.8) * 180.0
+            elif dist_ratio < 0.55:
+                penalty += (0.55 - dist_ratio) * 240.0
+            
+    return penalty if (low_condition or is_planar) else penalty * 0.25
+
+def choose_temporal_pose_candidate(context: bpy.types.Context, cam_data: Any, target_data: Any, reference_pose: Matrix, candidates: List[Matrix], prediction_pose: Matrix = None, mode: str = 'AUTO', strength_factor: float = 1.0, condition_score: float = 0.0, pin_count: int = 0, location_guide_pose: Matrix = None, guide_strength: float = 0.0) -> Optional[Matrix]:
+    points = get_active_pin_world_points(context, cam_data, target_data)
+    centroid, plane_normal, is_planar = get_pin_plane_hint(points)
+    low_condition = condition_score >= 0.45 or pin_count < 5
+    scored = []
+    guide_strength = max(0.0, min(5.0, float(guide_strength)))
+    for pose in candidates:
+        if pose is None:
+            continue
+        reproj = pose_reprojection_error(context, cam_data, target_data, pose)
+        if not np.isfinite(reproj):
+            continue
+        loc_err, rot_err = get_pose_delta(reference_pose, pose) if reference_pose else (0.0, 0.0)
+        pred_loc_err, pred_rot_err = get_pose_delta(prediction_pose, pose) if prediction_pose else (loc_err, rot_err)
+        guide_loc_err, _ = get_pose_delta(location_guide_pose, pose) if location_guide_pose else (0.0, 0.0)
+        flip_penalty = pose_flip_penalty(pose, reference_pose, points, centroid, plane_normal, is_planar, low_condition) if centroid is not None else 0.0
+        scored.append((reproj, loc_err, rot_err, pred_loc_err, pred_rot_err, flip_penalty, guide_loc_err, pose))
+        
+    if not scored:
+        return None
+        
+    best_reproj = min(item[0] for item in scored)
+    strength_factor = max(0.0, min(2.0, float(strength_factor)))
+    temporal_margin = (0.30 if mode == 'STRONG' else 0.20) * max(0.5, strength_factor)
+    if low_condition or is_planar:
+        temporal_margin *= 1.75 if mode == 'STRONG' else 1.35
+    tolerance = max(1.5 if (low_condition or is_planar) else 1.0, best_reproj * temporal_margin)
+    near_best = [item for item in scored if item[0] <= best_reproj + tolerance]
+    near_best.sort(key=lambda item: (item[5], item[6] * guide_strength + item[3] + item[4] * 10.0 + item[1] * 0.25, item[0]))
+    return near_best[0][7].copy()
+
+def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_mode: str = 'initial', skip_calib: bool = False, initial_pose_matrix: Optional[Matrix] = None, allow_global_fallback: bool = True) -> Tuple[bool, Optional[Matrix]]:
     try:
         if not camera_obj or not camera_obj.data: return False, None
             
@@ -915,11 +1715,14 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
         num_pins = len(valid_pins)
         if num_pins == 0: return False, None
             
-        depsgraph = context.evaluated_depsgraph_get()
-        eval_cam = camera_obj.evaluated_get(depsgraph)
-        
-        cam_loc, cam_rot, cam_scale = eval_cam.matrix_world.decompose()
-        cam_mat_unscaled = Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
+        if initial_pose_matrix is not None:
+            cam_loc, cam_rot, _ = initial_pose_matrix.decompose()
+            cam_mat_unscaled = Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
+        else:
+            depsgraph = context.evaluated_depsgraph_get()
+            eval_cam = camera_obj.evaluated_get(depsgraph)
+            cam_loc, cam_rot, _ = eval_cam.matrix_world.decompose()
+            cam_mat_unscaled = Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
             
         target_data.last_error = ""
         camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
@@ -942,7 +1745,8 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
             return False, None
 
         needs_calib = False if skip_calib else any([cam_data.calib_focal_length, cam_data.calib_optical_center, cam_data.calib_k1, cam_data.calib_k2, cam_data.calib_k3])
-        use_guess = (target_mode == 'tweak')
+        use_sequence_guess = initial_pose_matrix is not None
+        use_guess = (target_mode == 'tweak') or use_sequence_guess
         fallback_rvec, fallback_tvec = None, None
         
         if needs_calib:
@@ -961,7 +1765,7 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
             elif err_msg:
                 target_data.last_error = err_msg
 
-        success, mat, err = _estimate_pose(obj_pts, img_pts, camintr, distcoef, rvec_guess, tvec_guess, use_guess, fallback_rvec, fallback_tvec, use_planar=cam_data.use_planar_solve)
+        success, mat, err = _estimate_pose(obj_pts, img_pts, camintr, distcoef, rvec_guess, tvec_guess, use_guess, fallback_rvec, fallback_tvec, use_planar=cam_data.use_planar_solve, allow_global_fallback=allow_global_fallback)
         if not success and not target_data.last_error:
             target_data.last_error = err
         return success, mat
@@ -1204,6 +2008,9 @@ class PINSOLVER_OT_solve(PinSolverBaseOperator):
         if rv3d and rv3d.view_perspective != 'CAMERA':
             rv3d.view_perspective = 'CAMERA'
         cam_data.show_overlays = True
+        if cam_data.target_clip:
+            sync_scene_camera_from_clip(context, cam_data)
+            context.view_layer.update()
 
         success, result = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode=self.target_mode)
         if success and result:
@@ -1234,8 +2041,8 @@ class PINSOLVER_OT_sync_clip(PinSolverBaseOperator):
             res_y = float(clip.size[1])
             max_res = max(res_x, res_y)
             
-            px = res_x / 2.0 - (cam_ref.shift_x * max_res)
-            py = res_y / 2.0 - (cam_ref.shift_y * max_res)
+            px = res_x / 2.0 + (cam_ref.shift_x * max_res)
+            py = res_y / 2.0 + (cam_ref.shift_y * max_res)
             
             if bpy.app.version < (3, 5, 0): 
                 trk_cam.principal = [px, py]
@@ -1834,7 +2641,8 @@ class PINSOLVER_OT_sync_trackers(Operator):
                 new_pin.reproj_error = -1.0
                 
                 if len(t.markers) > 0:
-                    new_pin.pos_2d = (t.markers[0].co[0], t.markers[0].co[1])
+                    marker_co = get_track_marker_co(t, t.markers[0])
+                    new_pin.pos_2d = (marker_co.x, marker_co.y)
                 
                 p_idx = len(pins) - 1
                 new_pin.color = (*colorsys.hsv_to_rgb((p_idx * 0.618) % 1.0, 0.85, 1.0), 1.0)
@@ -1933,15 +2741,56 @@ class PINSOLVER_OT_bake_animation(Operator):
             bake_frames = list(range(context.scene.frame_start, context.scene.frame_end + 1))
             
         if not bake_frames: return {'CANCELLED'}
-        
         orig_frame = context.scene.frame_current
+        motion_source = getattr(cam_data, "sequence_motion_source", 'PNP')
+        if motion_source == 'MARKER_REFS' and cam_data.bake_target != 'SCENE':
+            self.report({'WARNING'}, "Timeline Markers source requires Scene Range")
+            return {'CANCELLED'}
+        use_existing_location = motion_source == 'EXISTING'
+        use_guided_location = motion_source == 'GUIDED'
+        use_marker_references = motion_source == 'MARKER_REFS'
+        marker_reference_frames = set()
+        marker_reference_pose_by_frame = {}
+        if use_marker_references:
+            marker_reference_frames = {
+                m.frame for m in context.scene.timeline_markers
+                if context.scene.frame_start <= m.frame <= context.scene.frame_end
+            }
+            if not marker_reference_frames:
+                self.report({'WARNING'}, "Timeline Markers source requires markers inside the scene range")
+                return {'CANCELLED'}
+            marker_reference_frames.add(cam_data.reference_frame)
+            for f in sorted(marker_reference_frames):
+                context.scene.frame_set(f)
+                context.view_layer.update()
+                depsgraph = context.evaluated_depsgraph_get()
+                marker_reference_pose_by_frame[f] = get_camera_unscaled_matrix(context.scene.camera, depsgraph)
+        existing_location_by_frame = {}
+        if use_existing_location or use_guided_location:
+            for f in bake_frames:
+                context.scene.frame_set(f)
+                context.view_layer.update()
+                depsgraph = context.evaluated_depsgraph_get()
+                existing_location_by_frame[f] = context.scene.camera.evaluated_get(depsgraph).matrix_world.translation.copy()
+        
         pins, _ = get_pins(cam_data, target_data)
+        valid_pin_count = sum(1 for p in pins if p.use_initial and p.has_valid_3d)
+        min_sequence_pins = 2 if use_existing_location else 4
+        if valid_pin_count < min_sequence_pins:
+            if use_existing_location:
+                self.report({'WARNING'}, "Existing Location requires 2+ valid pins for rotation solve")
+            else:
+                self.report({'WARNING'}, "Sequence PnP requires 4+ valid pins")
+            return {'CANCELLED'}
+            
         ref_3d_pos = {p.name: Vector(p.pos_3d) for p in pins}
         
         needs_calib = any([cam_data.calib_focal_length, cam_data.calib_optical_center, cam_data.calib_k1, cam_data.calib_k2, cam_data.calib_k3])
         
         cam_ref = context.scene.camera.data
         trk_cam = clip.tracking.camera
+        sync_scene_camera_from_clip(context, cam_data)
+        context.view_layer.update()
         
         # ----------------------------------------------------
         # Pass 1 - Ground Truth Calibration
@@ -1988,6 +2837,11 @@ class PINSOLVER_OT_bake_animation(Operator):
         target_obj_eval = target_obj.evaluated_get(depsgraph) if target_obj else None
         target_matrix_inv = target_obj_eval.matrix_world.inverted() if target_obj_eval else Matrix.Identity(4)
         ref_local_pos = {p.name: (target_matrix_inv @ Vector(p.pos_3d)) for p in pins}
+        ref_result = get_camera_unscaled_matrix(context.scene.camera, depsgraph)
+        ref_key_obj = target_obj if cam_data.solve_mode == 'OBJECT' else context.scene.camera
+        if cam_data.solve_mode == 'PARENT' and context.scene.camera.parent:
+            ref_key_obj = context.scene.camera.parent
+        ref_key_matrix = ref_key_obj.matrix_world.copy() if ref_key_obj else None
         
         # ----------------------------------------------------
         # Pass 2 - Chain Solving
@@ -1995,15 +2849,39 @@ class PINSOLVER_OT_bake_animation(Operator):
         success_count = 0
         frames_forward = [f for f in bake_frames if f >= cam_data.reference_frame]
         frames_backward = sorted([f for f in bake_frames if f < cam_data.reference_frame], reverse=True)
+        chain_pose = ref_result.copy()
+        chain_frame = cam_data.reference_frame
+        chain_prev_pose = None
+        chain_prev_frame = None
+        chain_prev2_pose = None
+        chain_prev2_frame = None
+        solved_pose_by_frame = {}
+        condition_by_frame = {}
+        pin_count_by_frame = {}
+        location_filter_strength = max(0.0, min(2.0, float(getattr(cam_data, "sequence_location_filter_strength", 1.0))))
+        guided_location_strength = max(0.0, min(2.0, float(getattr(cam_data, "sequence_guided_location_strength", 1.0))))
+        effective_stabilize_mode = getattr(cam_data, "sequence_stabilize_mode", 'OFF')
+        if location_filter_strength <= 1e-6:
+            effective_stabilize_mode = 'OFF'
         
-        context.scene.frame_set(cam_data.reference_frame)
-        success, ref_result = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib)
-        if not success:
-            self.report({'ERROR'}, f"Failed to solve Reference Frame ({cam_data.reference_frame}). Need 3+ valid pins.")
-            return {'CANCELLED'}
-        
+        def keyframe_current_target(f):
+            obj_to_key = target_obj if cam_data.solve_mode == 'OBJECT' else context.scene.camera
+            if cam_data.solve_mode == 'PARENT' and context.scene.camera.parent:
+                obj_to_key = context.scene.camera.parent
+            if not obj_to_key:
+                return False
+            if f == cam_data.reference_frame and ref_key_matrix is not None:
+                obj_to_key.matrix_world = ref_key_matrix.copy()
+                context.view_layer.update()
+            obj_to_key.keyframe_insert(data_path="location", frame=f)
+            if obj_to_key.rotation_mode == 'QUATERNION':
+                obj_to_key.keyframe_insert(data_path="rotation_quaternion", frame=f)
+            else:
+                obj_to_key.keyframe_insert(data_path="rotation_euler", frame=f)
+            return True
+
         def process_frame(f):
-            nonlocal success_count
+            nonlocal success_count, chain_pose, chain_frame, chain_prev_pose, chain_prev_frame, chain_prev2_pose, chain_prev2_frame
             context.scene.frame_set(f)
             context.view_layer.update()
             
@@ -2063,35 +2941,278 @@ class PINSOLVER_OT_bake_animation(Operator):
                 if cam_data.calib_optical_center:
                     cam_ref.keyframe_insert("shift_x", frame=f)
                     cam_ref.keyframe_insert("shift_y", frame=f)
+
+            if f == cam_data.reference_frame:
+                chain_pose = ref_result.copy()
+                chain_frame = f
+                chain_prev_pose = None
+                chain_prev_frame = None
+                chain_prev2_pose = None
+                chain_prev2_frame = None
+                solved_pose_by_frame[f] = ref_result.copy()
+                condition_score, pin_count = get_solve_condition_score(context, cam_data, target_data)
+                condition_by_frame[f] = condition_score
+                pin_count_by_frame[f] = pin_count
+                if keyframe_current_target(f):
+                    success_count += 1
+                return
+                
+            stabilize_mode = effective_stabilize_mode
+            marker_pose = marker_reference_pose_by_frame.get(f).copy() if use_marker_references and f in marker_reference_pose_by_frame else None
+            guide_loc = existing_location_by_frame.get(f) if use_guided_location else None
+            guided_pose = replace_pose_location(chain_pose, guide_loc) if guide_loc is not None else None
+            initial_pose = marker_pose if marker_pose is not None else (guided_pose if guided_pose is not None else chain_pose)
+            prediction_pose = extrapolate_location_pose(
+                chain_prev_pose, chain_prev_frame, chain_pose, chain_frame, f,
+                older_pose=chain_prev2_pose,
+                older_frame=chain_prev2_frame,
+                use_acceleration=(stabilize_mode == 'STRONG')
+            )
+            candidates = []
+            success, result = solve_camera_pose(
+                context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib,
+                initial_pose_matrix=initial_pose,
+                allow_global_fallback=False
+            )
+            if success and result:
+                candidates.append(result.copy())
+                
+            if ((use_guided_location and guided_pose is not None) or marker_pose is not None) and chain_pose is not None:
+                chain_success, chain_result = solve_camera_pose(
+                    context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib,
+                    initial_pose_matrix=chain_pose,
+                    allow_global_fallback=False
+                )
+                if chain_success and chain_result:
+                    candidates.append(chain_result.copy())
+                 
+            if not success and initial_pose is not None and stabilize_mode != 'STRONG':
+                success, fallback_result = solve_camera_pose(
+                    context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib,
+                    initial_pose_matrix=initial_pose,
+                    allow_global_fallback=True
+                )
+                if success and fallback_result:
+                    loc_err, rot_err = get_pose_delta(initial_pose, fallback_result)
+                    prev_loc, _, _ = initial_pose.decompose()
+                    depth_scale = max(1.0, prev_loc.length * 0.02)
+                    if loc_err <= depth_scale * 6.0 and rot_err <= np.deg2rad(35.0):
+                        result = fallback_result
+                    else:
+                        success = False
+                        result = None
+                if success and result:
+                    candidates.append(result.copy())
+                    
+            if not use_existing_location and stabilize_mode != 'OFF':
+                global_success, global_result = solve_camera_pose(
+                    context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib,
+                    initial_pose_matrix=None,
+                    allow_global_fallback=True
+                )
+                if global_success and global_result:
+                    candidates.append(global_result.copy())
+                    
+            if candidates:
+                candidate_condition_score, candidate_pin_count = get_solve_condition_score(context, cam_data, target_data)
+                chosen = choose_temporal_pose_candidate(
+                    context, cam_data, target_data, initial_pose, candidates,
+                    prediction_pose=prediction_pose,
+                    mode=stabilize_mode,
+                    strength_factor=location_filter_strength,
+                    condition_score=candidate_condition_score,
+                    pin_count=candidate_pin_count,
+                    location_guide_pose=marker_pose if marker_pose is not None else guided_pose,
+                    guide_strength=4.5 if marker_pose is not None else (3.0 * guided_location_strength if use_guided_location else 0.0)
+                )
+                if chosen:
+                    result = chosen
+                    success = True
             
-            success, result = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib)
+            if use_guided_location and guide_loc is not None and success and result:
+                result = smooth_guided_location_pose(result, guide_loc, guided_location_strength)
+                 
+            if use_existing_location:
+                anchor_loc = existing_location_by_frame.get(f)
+                if anchor_loc is None:
+                    return
+                base_pose = result if success and result else chain_pose
+                result = refine_rotation_for_fixed_location(context, cam_data, target_data, replace_pose_location(base_pose, anchor_loc))
+                success = True
             
             if success and result:
                 if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result):
                     context.view_layer.update() 
-                    
-                    obj_to_key = target_obj if cam_data.solve_mode == 'OBJECT' else context.scene.camera
-                    if cam_data.solve_mode == 'PARENT' and context.scene.camera.parent:
-                        obj_to_key = context.scene.camera.parent
-                        
-                    obj_to_key.keyframe_insert(data_path="location", frame=f)
-                    if obj_to_key.rotation_mode == 'QUATERNION':
-                        obj_to_key.keyframe_insert(data_path="rotation_quaternion", frame=f)
-                    else:
-                        obj_to_key.keyframe_insert(data_path="rotation_euler", frame=f)
-                    success_count += 1
+                    chain_prev2_pose = chain_prev_pose.copy() if chain_prev_pose else None
+                    chain_prev2_frame = chain_prev_frame
+                    chain_prev_pose = chain_pose.copy()
+                    chain_prev_frame = chain_frame
+                    chain_pose = result.copy()
+                    chain_frame = f
+                    solved_pose_by_frame[f] = result.copy()
+                    condition_score, pin_count = get_solve_condition_score(context, cam_data, target_data)
+                    condition_by_frame[f] = condition_score
+                    pin_count_by_frame[f] = pin_count
+                    if keyframe_current_target(f):
+                        success_count += 1
 
         context.scene.frame_set(cam_data.reference_frame)
         apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result)
         context.view_layer.update()
+        chain_pose = ref_result.copy()
+        chain_frame = cam_data.reference_frame
+        chain_prev_pose = None
+        chain_prev_frame = None
+        chain_prev2_pose = None
+        chain_prev2_frame = None
         for f in frames_forward:
             process_frame(f)
             
         context.scene.frame_set(cam_data.reference_frame)
         apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result)
         context.view_layer.update()
+        chain_pose = ref_result.copy()
+        chain_frame = cam_data.reference_frame
+        chain_prev_pose = None
+        chain_prev_frame = None
+        chain_prev2_pose = None
+        chain_prev2_frame = None
         for f in frames_backward:
             process_frame(f)
+            
+        marker_anchor_frames = set(marker_reference_frames) if use_marker_references else set()
+        marker_anchor_frames.add(cam_data.reference_frame)
+        fixed_reference_frames = set(marker_anchor_frames) if use_marker_references else {cam_data.reference_frame}
+        
+        if use_marker_references:
+            aligned_pose_by_frame = align_marker_reference_segments(solved_pose_by_frame, marker_reference_pose_by_frame, marker_anchor_frames)
+            for f in sorted(aligned_pose_by_frame.keys()):
+                context.scene.frame_set(f)
+                restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                corrected_pose = aligned_pose_by_frame[f].copy() if f in fixed_reference_frames else refine_rotation_for_fixed_location(context, cam_data, target_data, aligned_pose_by_frame[f])
+                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose):
+                    context.view_layer.update()
+                    solved_pose_by_frame[f] = corrected_pose.copy()
+                    keyframe_current_target(f)
+            
+        if not use_existing_location and effective_stabilize_mode != 'OFF' and len(solved_pose_by_frame) >= 2:
+            mode = effective_stabilize_mode
+            sorted_frames = sorted(bake_frames)
+            anchor_frames = [
+                f for f in sorted_frames
+                if f in solved_pose_by_frame and (f in marker_anchor_frames or (condition_by_frame.get(f, 1.0) < 0.45 and pin_count_by_frame.get(f, 0) >= 5))
+            ]
+            for ref_f in sorted(marker_anchor_frames):
+                if ref_f in solved_pose_by_frame and ref_f not in anchor_frames:
+                    anchor_frames.append(ref_f)
+                anchor_frames.sort()
+                
+            bad_frames = set()
+            for f in sorted_frames:
+                if f in fixed_reference_frames:
+                    continue
+                prev_anchors = [af for af in anchor_frames if af < f]
+                next_anchors = [af for af in anchor_frames if af > f]
+                if not prev_anchors or not next_anchors:
+                    continue
+                prev_f = max(prev_anchors)
+                next_f = min(next_anchors)
+                prev_pose = solved_pose_by_frame[prev_f]
+                next_pose = solved_pose_by_frame[next_f]
+                factor = (f - prev_f) / max(1.0, next_f - prev_f)
+                expected = interpolate_pose_matrices(prev_pose, next_pose, factor)
+                condition_score = condition_by_frame.get(f, 1.0)
+                pin_count = pin_count_by_frame.get(f, 0)
+                if f not in solved_pose_by_frame:
+                    bad_frames.add(f)
+                    continue
+                loc_err, rot_err = get_pose_delta(expected, solved_pose_by_frame[f])
+                span_loc, span_rot = get_pose_delta(prev_pose, next_pose)
+                expected_loc, _, _ = expected.decompose()
+                depth_scale = max(1.0, expected_loc.length * 0.02)
+                if mode == 'STRONG':
+                    loc_limit = max(depth_scale * 2.5, span_loc * 2.0)
+                    rot_limit = max(np.deg2rad(14.0), span_rot * 2.0 + np.deg2rad(5.0))
+                else:
+                    loc_limit = max(depth_scale * 4.0, span_loc * 2.5)
+                    rot_limit = max(np.deg2rad(24.0), span_rot * 2.5 + np.deg2rad(8.0))
+                low_condition = condition_score >= 0.45 or pin_count < 5
+                if low_condition and (loc_err > loc_limit or rot_err > rot_limit):
+                    bad_frames.add(f)
+            
+            if bad_frames:
+                for f in sorted(bad_frames):
+                    prev_anchors = [af for af in anchor_frames if af < f]
+                    next_anchors = [af for af in anchor_frames if af > f]
+                    if not prev_anchors or not next_anchors:
+                        continue
+                    prev_f = max(prev_anchors)
+                    next_f = min(next_anchors)
+                    factor = (f - prev_f) / max(1.0, next_f - prev_f)
+                    anchor_repaired_pose = interpolate_pose_matrices(solved_pose_by_frame[prev_f], solved_pose_by_frame[next_f], factor)
+                    if f in solved_pose_by_frame:
+                        repaired_pose = interpolate_pose_matrices(solved_pose_by_frame[f], anchor_repaired_pose, min(1.0, location_filter_strength))
+                    else:
+                        repaired_pose = anchor_repaired_pose
+                    context.scene.frame_set(f)
+                    restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                    if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, repaired_pose):
+                        context.view_layer.update()
+                        solved_pose_by_frame[f] = repaired_pose.copy()
+                        keyframe_current_target(f)
+            
+            stabilized_pose_by_frame = stabilize_location_pose_path(
+                solved_pose_by_frame,
+                condition_by_frame,
+                pin_count_by_frame,
+                mode,
+                location_filter_strength,
+                fixed_reference_frames,
+                marker_reference_pose_by_frame if use_marker_references else None
+            )
+            for f in sorted(stabilized_pose_by_frame.keys()):
+                if f in fixed_reference_frames:
+                    continue
+                context.scene.frame_set(f)
+                restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                corrected_pose = refine_rotation_for_fixed_location(context, cam_data, target_data, stabilized_pose_by_frame[f])
+                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose):
+                    context.view_layer.update()
+                    solved_pose_by_frame[f] = corrected_pose.copy()
+                    keyframe_current_target(f)
+            
+            if use_marker_references:
+                reinforced_pose_by_frame = reinforce_fixed_reference_transitions(
+                    solved_pose_by_frame,
+                    fixed_reference_frames,
+                    mode,
+                    location_filter_strength
+                )
+                for f in sorted(reinforced_pose_by_frame.keys()):
+                    if f in fixed_reference_frames:
+                        continue
+                    context.scene.frame_set(f)
+                    restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                    corrected_pose = refine_rotation_for_fixed_location(context, cam_data, target_data, reinforced_pose_by_frame[f])
+                    if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose):
+                        context.view_layer.update()
+                        solved_pose_by_frame[f] = corrected_pose.copy()
+                        keyframe_current_target(f)
+        
+        roll_smoothed_pose_by_frame = stabilize_roll_pose_path(
+            solved_pose_by_frame,
+            getattr(cam_data, "sequence_roll_smoothing", 'OFF'),
+            cam_data.reference_frame,
+            getattr(cam_data, "sequence_roll_smoothing_strength", 1.0),
+            fixed_reference_frames
+        )
+        for f in sorted(roll_smoothed_pose_by_frame.keys()):
+            context.scene.frame_set(f)
+            restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+            if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, roll_smoothed_pose_by_frame[f]):
+                context.view_layer.update()
+                solved_pose_by_frame[f] = roll_smoothed_pose_by_frame[f].copy()
+                keyframe_current_target(f)
             
         # ----------------------------------------------------
         # Pass 3 - Evaluation of raw OpenCV data after the process has fully completed
@@ -2590,19 +3711,57 @@ class PINSOLVER_PT_panel(Panel):
                 ref_row.prop(cam_data, "reference_frame")
                 ref_row.operator("view3d.pinsolver_set_reference_frame", text="", icon='TIME')
                 
+                opt_row = col_bake.row(align=True)
+                opt_row.prop(cam_data, "show_sequence_options", text="Options", icon='TRIA_DOWN' if cam_data.show_sequence_options else 'TRIA_RIGHT', emboss=False)
+                if cam_data.show_sequence_options:
+                    opt_box = col_bake.column(align=True)
+                    opt_box.prop(cam_data, "sequence_motion_source", text="Location")
+                    if cam_data.sequence_motion_source == 'MARKER_REFS' and cam_data.bake_target != 'SCENE':
+                        opt_box.label(text="Timeline Markers source requires Scene Range", icon='ERROR')
+                    if cam_data.sequence_motion_source in {'PNP', 'GUIDED', 'MARKER_REFS'}:
+                        if cam_data.sequence_motion_source == 'GUIDED':
+                            opt_box.label(text="Existing curve guides solve and final location")
+                            opt_box.prop(cam_data, "sequence_guided_location_strength", slider=True)
+                        elif cam_data.sequence_motion_source == 'MARKER_REFS':
+                            opt_box.label(text="Marker frames stay fixed; neighbors are blended")
+                        else:
+                            opt_box.label(text="Solves location from active pins")
+                        opt_box.separator()
+                        opt_box.label(text="Location Filter")
+                        filter_row = opt_box.row(align=True)
+                        filter_row.prop(cam_data, "sequence_stabilize_mode", expand=True)
+                        if cam_data.sequence_stabilize_mode != 'OFF':
+                            opt_box.prop(cam_data, "sequence_location_filter_strength", slider=True)
+                        if cam_data.sequence_motion_source == 'MARKER_REFS':
+                            opt_box.label(text="Filter also eases into fixed marker frames")
+                    else:
+                        opt_box.label(text="Keeps existing location; solves rotation from pins")
+                    opt_box.separator()
+                    opt_box.label(text="Roll Smoothing")
+                    opt_box.row(align=True).prop(cam_data, "sequence_roll_smoothing", expand=True)
+                    if cam_data.sequence_roll_smoothing != 'OFF':
+                        opt_box.prop(cam_data, "sequence_roll_smoothing_strength", slider=True)
+                 
                 col_bake.separator()
-                
+                 
                 valid_pin_count = sum(1 for p in pins if p.use_initial and p.has_valid_3d)
+                min_sequence_pins = 2 if cam_data.sequence_motion_source == 'EXISTING' else 4
+                marker_refs_invalid = cam_data.sequence_motion_source == 'MARKER_REFS' and cam_data.bake_target != 'SCENE'
 
                 r_single = col_bake.row()
                 r_single.enabled = (valid_pin_count > 0)
                 r_single.operator("view3d.pinsolver_solve", icon='PLAY', text="Single Solve (Current Frame)")
-                
+                 
                 r_bake = col_bake.row()
                 r_bake.scale_y = 2.0
-                r_bake.enabled = (valid_pin_count >= 4)
-                if valid_pin_count < 4:
-                    r_bake.operator("view3d.pinsolver_bake_animation", icon='ERROR', text="Need 4+ Valid Pins for Sequence")
+                r_bake.enabled = (valid_pin_count >= min_sequence_pins and not marker_refs_invalid)
+                if marker_refs_invalid:
+                    r_bake.operator("view3d.pinsolver_bake_animation", icon='ERROR', text="Timeline Markers Requires Scene Range")
+                elif valid_pin_count < min_sequence_pins:
+                    if cam_data.sequence_motion_source == 'EXISTING':
+                        r_bake.operator("view3d.pinsolver_bake_animation", icon='ERROR', text="Need 2+ Valid Pins for Existing Location")
+                    else:
+                        r_bake.operator("view3d.pinsolver_bake_animation", icon='ERROR', text="Need 4+ Valid Pins for Sequence")
                 else:
                     r_bake.operator("view3d.pinsolver_bake_animation", icon='REC')
 
@@ -2804,7 +3963,8 @@ classes = (
     PINSOLVER_OT_pick_2d, PINSOLVER_OT_pick_3d, PINSOLVER_OT_auto_raycast_single, PINSOLVER_OT_sync_clip, PINSOLVER_OT_clear_pins,
     PINSOLVER_OT_add_pin, PINSOLVER_OT_remove_pin, PINSOLVER_OT_solve, 
     PINSOLVER_OT_edit_pins, PINSOLVER_OT_tweak, PINSOLVER_PT_panel,
-    PINSOLVER_OT_send_to_layout, PINSOLVER_OT_sync_trackers, PINSOLVER_OT_auto_raycast, PINSOLVER_OT_set_reference_frame, PINSOLVER_OT_bake_animation
+    PINSOLVER_OT_send_to_layout, PINSOLVER_OT_sync_trackers, PINSOLVER_OT_auto_raycast, PINSOLVER_OT_set_reference_frame,
+    PINSOLVER_OT_bake_animation
 )
 
 def register(): PinSolverAddon.register()
