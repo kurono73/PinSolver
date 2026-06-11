@@ -544,6 +544,36 @@ def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector,
         return True, loc
     return False, None
 
+def raycast_pin_from_current_camera(context: bpy.types.Context, cam_data: Any, pin: Any) -> Tuple[bool, Optional[Vector]]:
+    camera_obj = context.scene.camera
+    if not camera_obj or not camera_obj.data:
+        return False, None
+        
+    p2d = get_current_pin_pos_2d(context, cam_data, pin)
+    if p2d is None:
+        return False, None
+        
+    depsgraph = context.evaluated_depsgraph_get()
+    cam_pose = get_camera_unscaled_matrix(camera_obj, depsgraph)
+    camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
+    px, py = to_cv_pixel(p2d.x, p2d.y, res_x, res_y)
+    
+    if HAS_OPENCV and np.linalg.norm(distcoef) > 1e-8:
+        pt = np.array([[[px, py]]], dtype=np.float64)
+        undist = cv2.undistortPoints(pt, camintr, distcoef)
+        x = float(undist[0][0][0])
+        y = float(undist[0][0][1])
+    else:
+        x = (px - camintr[0, 2]) / max(1e-8, camintr[0, 0])
+        y = (py - camintr[1, 2]) / max(1e-8, camintr[1, 1])
+        
+    ray_cv = Vector((x, y, 1.0)).normalized()
+    R_bcam2cv = Matrix(((1, 0, 0), (0, -1, 0), (0, 0, -1)))
+    R_world2bcam = cam_pose.to_3x3().transposed()
+    R_world2cv = R_bcam2cv @ R_world2bcam
+    direction = (R_world2cv.transposed() @ ray_cv).normalized()
+    return safe_ray_cast(context, cam_pose.translation, direction)
+
 def get_track_objects(self, context):
     items = []
     if self.target_clip:
@@ -684,6 +714,11 @@ class PinSolverData(PropertyGroup):
         soft_max=2.0,
         subtype='FACTOR',
         description="Adjust how strongly Guided Location follows the existing camera location curve"
+    )
+    sequence_auto_raycast_new_tracks: BoolProperty(
+        name="Auto Raycast New Tracks",
+        default=False,
+        description="During sequence bake, raycast newly active trackers after their first solved frame so they can join later frames"
     )
     sequence_roll_smoothing: EnumProperty(
         name="Roll Smoothing",
@@ -2655,8 +2690,8 @@ class PINSOLVER_OT_sync_trackers(Operator):
 
 class PINSOLVER_OT_auto_raycast(Operator):
     bl_idname = "view3d.pinsolver_auto_raycast"
-    bl_label = "Auto Raycast 3D Pins"
-    bl_description = "Automatically shoot lasers from the camera through linked 2D Pins to find their 3D positions"
+    bl_label = "Raycast Current Tracks"
+    bl_description = "Raycast currently visible linked trackers from the current camera pose to place their 3D pins"
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
@@ -2694,7 +2729,7 @@ class PINSOLVER_OT_auto_raycast(Operator):
                 
         update_reproj_errors(context, cam_data, target_data, force_update=True)
         redraw_all_3d_views(context)
-        self.report({'INFO'}, f"Auto-Raycasted {hit_count} pins")
+        self.report({'INFO'}, f"Raycasted {hit_count} current tracks")
         return {'FINISHED'}
 
 class PINSOLVER_OT_set_reference_frame(Operator):
@@ -2860,6 +2895,8 @@ class PINSOLVER_OT_bake_animation(Operator):
         pin_count_by_frame = {}
         location_filter_strength = max(0.0, min(2.0, float(getattr(cam_data, "sequence_location_filter_strength", 1.0))))
         guided_location_strength = max(0.0, min(2.0, float(getattr(cam_data, "sequence_guided_location_strength", 1.0))))
+        auto_raycast_new_tracks = bool(getattr(cam_data, "sequence_auto_raycast_new_tracks", False))
+        auto_raycasted_count = 0
         effective_stabilize_mode = getattr(cam_data, "sequence_stabilize_mode", 'OFF')
         if location_filter_strength <= 1e-6:
             effective_stabilize_mode = 'OFF'
@@ -2879,6 +2916,35 @@ class PINSOLVER_OT_bake_animation(Operator):
             else:
                 obj_to_key.keyframe_insert(data_path="rotation_euler", frame=f)
             return True
+            
+        def raycast_new_active_tracks_after_solve():
+            nonlocal auto_raycasted_count
+            if not auto_raycast_new_tracks:
+                return
+                
+            depsgraph = context.evaluated_depsgraph_get()
+            tgt_inv = Matrix.Identity(4)
+            if target_obj:
+                try:
+                    tgt_inv = target_obj.evaluated_get(depsgraph).matrix_world.inverted()
+                except Exception:
+                    tgt_inv = Matrix.Identity(4)
+            
+            for pin in pins:
+                if not pin.is_track_linked or not pin.use_initial or pin.has_valid_3d:
+                    continue
+                if get_current_pin_pos_2d(context, cam_data, pin) is None:
+                    continue
+                    
+                hit, loc = raycast_pin_from_current_camera(context, cam_data, pin)
+                if not hit or loc is None:
+                    continue
+                    
+                pin.pos_3d = loc
+                pin.has_valid_3d = True
+                ref_3d_pos[pin.name] = Vector(loc)
+                ref_local_pos[pin.name] = tgt_inv @ Vector(loc)
+                auto_raycasted_count += 1
 
         def process_frame(f):
             nonlocal success_count, chain_pose, chain_frame, chain_prev_pose, chain_prev_frame, chain_prev2_pose, chain_prev2_frame
@@ -2955,6 +3021,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 pin_count_by_frame[f] = pin_count
                 if keyframe_current_target(f):
                     success_count += 1
+                raycast_new_active_tracks_after_solve()
                 return
                 
             stabilize_mode = effective_stabilize_mode
@@ -3055,6 +3122,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                     pin_count_by_frame[f] = pin_count
                     if keyframe_current_target(f):
                         success_count += 1
+                    raycast_new_active_tracks_after_solve()
 
         context.scene.frame_set(cam_data.reference_frame)
         apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result)
@@ -3267,7 +3335,8 @@ class PINSOLVER_OT_bake_animation(Operator):
         redraw_all_3d_views(context)
         
         final_err_msg = f" | Seq Avg Error: {(total_reproj_error/success_count):.2f} px" if success_count > 0 else ""
-        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg)
+        raycast_msg = f" | Auto Raycast: {auto_raycasted_count}" if auto_raycasted_count > 0 else ""
+        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg)
         return {'FINISHED'}
 
 # ==========================================
@@ -3589,6 +3658,9 @@ class PINSOLVER_PT_panel(Panel):
                 box_mm.prop(cam_data, "tracking_object_idx", text="Track Layer")
             box_mm.operator("view3d.pinsolver_sync_trackers", icon='TRACKING')
             box_mm.operator("view3d.pinsolver_auto_raycast", icon='CON_TRACKTO')
+            box_mm.prop(cam_data, "sequence_auto_raycast_new_tracks")
+            if cam_data.sequence_auto_raycast_new_tracks:
+                box_mm.label(text="Raycasts new active trackers during bake")
             layout.separator()
 
         if target_data:
@@ -3736,7 +3808,6 @@ class PINSOLVER_PT_panel(Panel):
                             opt_box.label(text="Filter also eases into fixed marker frames")
                     else:
                         opt_box.label(text="Keeps existing location; solves rotation from pins")
-                    opt_box.separator()
                     opt_box.label(text="Roll Smoothing")
                     opt_box.row(align=True).prop(cam_data, "sequence_roll_smoothing", expand=True)
                     if cam_data.sequence_roll_smoothing != 'OFF':
