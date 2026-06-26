@@ -1033,6 +1033,52 @@ def get_camera_unscaled_matrix(camera_obj: bpy.types.Object, depsgraph: Any = No
     cam_loc, cam_rot, _ = eval_cam.matrix_world.decompose()
     return Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
 
+def disable_camera_solver_constraints(camera_obj: bpy.types.Object) -> int:
+    if not camera_obj:
+        return 0
+    disabled = 0
+    for con in getattr(camera_obj, "constraints", []):
+        name = getattr(con, "name", "")
+        con_type = getattr(con, "type", "")
+        if name != "Camera Solver" and con_type != 'CAMERA_SOLVER':
+            continue
+        changed = False
+        if hasattr(con, "enabled"):
+            try:
+                if con.enabled:
+                    con.enabled = False
+                    changed = True
+            except Exception:
+                pass
+        if not changed and hasattr(con, "mute"):
+            try:
+                if not con.mute:
+                    con.mute = True
+                    changed = True
+            except Exception:
+                pass
+        if not changed and hasattr(con, "influence"):
+            try:
+                if con.influence != 0.0:
+                    con.influence = 0.0
+                    changed = True
+            except Exception:
+                pass
+        if changed:
+            disabled += 1
+    return disabled
+
+def capture_parent_camera_local_matrix(context: bpy.types.Context, camera_obj: bpy.types.Object) -> Optional[Matrix]:
+    if not camera_obj or not camera_obj.parent:
+        return None
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+        eval_parent = camera_obj.parent.evaluated_get(depsgraph)
+        eval_cam = camera_obj.evaluated_get(depsgraph)
+        return eval_parent.matrix_world.inverted() @ eval_cam.matrix_world
+    except Exception:
+        return None
+
 def interpolate_pose_matrices(a: Matrix, b: Matrix, factor: float) -> Matrix:
     factor = max(0.0, min(1.0, float(factor)))
     loc_a, rot_a, scale_a = a.decompose()
@@ -1810,7 +1856,7 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
         target_data.last_error = f"Err: {type(e).__name__} {str(e)[:20]}"
         return False, None
 
-def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_obj: bpy.types.Object, result_matrix: Matrix) -> bool:
+def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_obj: bpy.types.Object, result_matrix: Matrix, parent_camera_local_matrix: Optional[Matrix] = None) -> bool:
     try:
         depsgraph = context.evaluated_depsgraph_get()
         eval_cam = camera_obj.evaluated_get(depsgraph)
@@ -1839,8 +1885,11 @@ def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: A
             M_parent_world = eval_parent.matrix_world.copy()
             M_cam_world = eval_cam.matrix_world.copy()
             
-            try: M_cam_local = M_parent_world.inverted() @ M_cam_world
-            except ValueError: return False
+            if parent_camera_local_matrix is not None:
+                M_cam_local = parent_camera_local_matrix.copy()
+            else:
+                try: M_cam_local = M_parent_world.inverted() @ M_cam_world
+                except ValueError: return False
             
             target_loc, target_rot, _ = result_matrix.decompose()
             M_cam_world_target = Matrix.LocRotScale(target_loc, target_rot, cam_scale)
@@ -1848,9 +1897,7 @@ def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: A
             try: M_parent_world_target = M_cam_world_target @ M_cam_local.inverted()
             except ValueError: return False
             
-            orig_parent_scale = parent_obj.matrix_world.to_scale()
-            loc, rot, _ = M_parent_world_target.decompose()
-            parent_obj.matrix_world = Matrix.LocRotScale(loc, rot, orig_parent_scale)
+            parent_obj.matrix_world = M_parent_world_target
             return True
             
         else: # CAMERA
@@ -2874,8 +2921,10 @@ class PINSOLVER_OT_bake_animation(Operator):
         ref_local_pos = {p.name: (target_matrix_inv @ Vector(p.pos_3d)) for p in pins}
         ref_result = get_camera_unscaled_matrix(context.scene.camera, depsgraph)
         ref_key_obj = target_obj if cam_data.solve_mode == 'OBJECT' else context.scene.camera
+        ref_parent_camera_local = None
         if cam_data.solve_mode == 'PARENT' and context.scene.camera.parent:
             ref_key_obj = context.scene.camera.parent
+            ref_parent_camera_local = capture_parent_camera_local_matrix(context, context.scene.camera)
         ref_key_matrix = ref_key_obj.matrix_world.copy() if ref_key_obj else None
         
         # ----------------------------------------------------
@@ -3108,7 +3157,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 success = True
             
             if success and result:
-                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result):
+                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result, ref_parent_camera_local):
                     context.view_layer.update() 
                     chain_prev2_pose = chain_prev_pose.copy() if chain_prev_pose else None
                     chain_prev2_frame = chain_prev_frame
@@ -3125,7 +3174,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                     raycast_new_active_tracks_after_solve()
 
         context.scene.frame_set(cam_data.reference_frame)
-        apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result)
+        apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result, ref_parent_camera_local)
         context.view_layer.update()
         chain_pose = ref_result.copy()
         chain_frame = cam_data.reference_frame
@@ -3137,7 +3186,7 @@ class PINSOLVER_OT_bake_animation(Operator):
             process_frame(f)
             
         context.scene.frame_set(cam_data.reference_frame)
-        apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result)
+        apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result, ref_parent_camera_local)
         context.view_layer.update()
         chain_pose = ref_result.copy()
         chain_frame = cam_data.reference_frame
@@ -3158,7 +3207,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 context.scene.frame_set(f)
                 restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
                 corrected_pose = aligned_pose_by_frame[f].copy() if f in fixed_reference_frames else refine_rotation_for_fixed_location(context, cam_data, target_data, aligned_pose_by_frame[f])
-                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose):
+                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose, ref_parent_camera_local):
                     context.view_layer.update()
                     solved_pose_by_frame[f] = corrected_pose.copy()
                     keyframe_current_target(f)
@@ -3224,7 +3273,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                         repaired_pose = anchor_repaired_pose
                     context.scene.frame_set(f)
                     restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
-                    if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, repaired_pose):
+                    if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, repaired_pose, ref_parent_camera_local):
                         context.view_layer.update()
                         solved_pose_by_frame[f] = repaired_pose.copy()
                         keyframe_current_target(f)
@@ -3244,7 +3293,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 context.scene.frame_set(f)
                 restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
                 corrected_pose = refine_rotation_for_fixed_location(context, cam_data, target_data, stabilized_pose_by_frame[f])
-                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose):
+                if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose, ref_parent_camera_local):
                     context.view_layer.update()
                     solved_pose_by_frame[f] = corrected_pose.copy()
                     keyframe_current_target(f)
@@ -3262,7 +3311,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                     context.scene.frame_set(f)
                     restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
                     corrected_pose = refine_rotation_for_fixed_location(context, cam_data, target_data, reinforced_pose_by_frame[f])
-                    if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose):
+                    if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, corrected_pose, ref_parent_camera_local):
                         context.view_layer.update()
                         solved_pose_by_frame[f] = corrected_pose.copy()
                         keyframe_current_target(f)
@@ -3277,7 +3326,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         for f in sorted(roll_smoothed_pose_by_frame.keys()):
             context.scene.frame_set(f)
             restore_sequence_pin_positions(context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
-            if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, roll_smoothed_pose_by_frame[f]):
+            if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, roll_smoothed_pose_by_frame[f], ref_parent_camera_local):
                 context.view_layer.update()
                 solved_pose_by_frame[f] = roll_smoothed_pose_by_frame[f].copy()
                 keyframe_current_target(f)
@@ -3334,9 +3383,11 @@ class PINSOLVER_OT_bake_animation(Operator):
 
         redraw_all_3d_views(context)
         
+        disabled_solver_count = disable_camera_solver_constraints(context.scene.camera)
         final_err_msg = f" | Seq Avg Error: {(total_reproj_error/success_count):.2f} px" if success_count > 0 else ""
         raycast_msg = f" | Auto Raycast: {auto_raycasted_count}" if auto_raycasted_count > 0 else ""
-        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg)
+        solver_msg = " | Camera Solver disabled" if disabled_solver_count > 0 else ""
+        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + solver_msg)
         return {'FINISHED'}
 
 # ==========================================
