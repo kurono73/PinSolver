@@ -1,3 +1,5 @@
+We recommend downloading from “Extensions.” The download from GitHub does not include the OpenCV wheels.
+
 ## Overview
 PinSolver is a Blender add-on that leverages OpenCV's powerful PnP (Perspective-n-Point) algorithm to provide intuitive, fast camera and object alignment. By linking 2D coordinates (●) on an image to 3D coordinates (■) in 3D space, it seamlessly supports everything from static object placement to full-fledged video matchmoving. 
 
