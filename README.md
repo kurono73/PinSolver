@@ -36,6 +36,9 @@ PinSolver includes two distinct modes depending on your objective:
 * **Interactive Pin Editor:** Safely add, delete, and fine-tune pins across split viewports without triggering a solve computation.
 * **Clear All Pins:** A single trash can button safely and instantly resets all accumulated pins.
 
+### 📐 Pin Align
+* Aligns a Source mesh to a Target mesh from matching 3D pin pairs, with optional ICP refinement.
+
 ---
 
 ## Mode-Specific Features
@@ -100,6 +103,15 @@ PinSolver includes two distinct modes depending on your objective:
 
 **Roll Smoothing:** Reduces sudden roll jitter during Matchmove solving.
 
+
+
+### Pin Align (3D Model Alignment)
+1. In the 3D Viewport sidebar, open the **PinSolver > Pin Align** panel.
+2. Set the mesh to move as **Source** and the reference mesh as **Target**. With two meshes selected, the selection button assigns the active mesh as Target.
+3. Add at least three **Alignment Pins**. Pick matching points on both meshes; Source and Target points can be picked in either order.
+4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the meshes need a uniform scale adjustment.
+5. Use **Preview ICP** to refine the Source against the Target. Set a **Source Mask** when only part of the Source should contribute to the match.
+6. Click **Apply** to keep the previewed transform, or **Revert** to restore the Source transform.
 
 
 ## Q&A / Troubleshooting
