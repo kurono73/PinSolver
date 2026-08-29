@@ -13,7 +13,16 @@ import numpy as np
 import colorsys
 import traceback
 import math
+import time
+import threading
+from dataclasses import replace
 from typing import Tuple, Optional, Any, List, Dict, Set
+
+from .icp.geometry import extract_world_triangles, object_fingerprint, sample_surface_points_with_normals
+from .icp.cancel import IcpCancelled
+from .icp.models import IcpSettings
+from .icp.registration import run_icp
+from .icp.transforms import compose_source_world_matrix, rigid_transform_from_points, similarity_transform_from_points, transform_delta_metrics
 
 try:
     import cv2
@@ -95,6 +104,9 @@ def _get_active_camera_view(context: bpy.types.Context) -> Tuple[Any, Any]:
                                 return r, space.region_3d
     return None, None
 
+def is_live_layout_tweak(cam_data: Any) -> bool:
+    return bool(cam_data and getattr(cam_data, "ui_mode", None) == 'LAYOUT' and getattr(cam_data, "is_tweak_mode", False))
+
 def get_camera_frame_bounds(context: bpy.types.Context, region=None, rv3d=None) -> Optional[Tuple[float, float, float, float]]:
     scene = context.scene
     camera = scene.camera
@@ -104,9 +116,12 @@ def get_camera_frame_bounds(context: bpy.types.Context, region=None, rv3d=None) 
         return None
         
     frame_local = camera.data.view_frame(scene=scene)
-    depsgraph = context.evaluated_depsgraph_get()
-    eval_cam = camera.evaluated_get(depsgraph)
-    cam_mat = eval_cam.matrix_world
+    if is_live_layout_tweak(getattr(camera, "pinsolver_data", None)):
+        cam_mat = camera.matrix_world.copy()
+    else:
+        depsgraph = context.evaluated_depsgraph_get()
+        eval_cam = camera.evaluated_get(depsgraph)
+        cam_mat = eval_cam.matrix_world
     
     min_x, min_y = float('inf'), float('inf')
     max_x, max_y = float('-inf'), float('-inf')
@@ -190,6 +205,40 @@ def sync_scene_camera_from_clip(context: bpy.types.Context, cam_data: Any) -> bo
         return True
     except Exception:
         return False
+
+def sync_clip_camera_from_scene(context: bpy.types.Context, cam_data: Any) -> bool:
+    clip = cam_data.target_clip
+    camera_obj = context.scene.camera
+    if not clip or not camera_obj or not camera_obj.data:
+        return False
+        
+    trk_cam = clip.tracking.camera
+    cam_ref = camera_obj.data
+    try:
+        trk_cam.sensor_width = cam_ref.sensor_width
+        trk_cam.focal_length = cam_ref.lens
+        
+        res_x = max(1.0, float(clip.size[0]))
+        res_y = max(1.0, float(clip.size[1]))
+        max_res = max(res_x, res_y)
+        px = res_x / 2.0 + (cam_ref.shift_x * max_res)
+        py = res_y / 2.0 + (cam_ref.shift_y * max_res)
+        if bpy.app.version < (3, 5, 0): 
+            trk_cam.principal = [px, py]
+        else: 
+            trk_cam.principal_point_pixels = [px, py]
+        return True
+    except Exception:
+        return False
+
+def apply_lens_to_scene_and_clip(camera_obj: bpy.types.Object, clip: Any, lens_mm: float):
+    if camera_obj and camera_obj.data:
+        camera_obj.data.lens = float(lens_mm)
+    if clip:
+        try:
+            clip.tracking.camera.focal_length = float(lens_mm)
+        except Exception:
+            pass
 
 def _get_undistorted_2d_coords_cached(p2d: Vector, bounds: Tuple, camintr: np.ndarray, distcoef: np.ndarray, res_x: float, res_y: float) -> Optional[Vector]:
     if not bounds or p2d is None: return None
@@ -583,6 +632,11 @@ def get_track_objects(self, context):
         items.append(("0", "Camera", ""))
     return items
 
+def set_pin_3d_provenance(pin: Any, auto_raycasted: bool, frame: int = -1, direction: int = 0) -> None:
+    pin.is_auto_raycast_3d = bool(auto_raycasted)
+    pin.auto_raycast_frame = int(frame) if auto_raycasted else -1
+    pin.auto_raycast_direction = (1 if direction >= 0 else -1) if auto_raycasted else 0
+
 # ==========================================
 # 1. Data Structures & Settings
 # ==========================================
@@ -617,6 +671,9 @@ class PinSolverPin(PropertyGroup):
     reproj_error: FloatProperty(name="Error", default=0.0, description="Current reprojection error distance in pixels")
     track_name: StringProperty(name="Track Name", default="")
     is_track_linked: BoolProperty(default=False)
+    is_auto_raycast_3d: BoolProperty(default=False, options={'HIDDEN'})
+    auto_raycast_frame: IntProperty(default=-1, options={'HIDDEN'})
+    auto_raycast_direction: IntProperty(default=0, min=-1, max=1, options={'HIDDEN'})
 
 class PinSolverTargetItem(PropertyGroup):
     obj: PointerProperty(type=bpy.types.Object, name="Object", description="Select the object to be aligned")
@@ -625,16 +682,65 @@ class PinSolverTargetItem(PropertyGroup):
 # Draw Handler Management
 # ==========================================
 _draw_handle = None
+_icp_draw_handle = None
+_icp_runtime_state = {
+    "original_source_matrix": None,
+    "preview_source_matrix": None,
+    "result_transform": None,
+    "source_fingerprint": None,
+    "target_fingerprint": None,
+    "cancel_event": None,
+    "owner_scene": None,
+    "owner_source": None,
+    "owner_target": None,
+    "input_invalidated": False,
+}
+_icp_object_change_guard = False
 
 def update_show_overlays(self, context):
     global _draw_handle
     if self.show_overlays:
+        icp_data = getattr(context.scene, "pinsolver_icp", None)
+        if icp_data and getattr(icp_data, "show_preview_overlay", False):
+            icp_data.show_preview_overlay = False
         if _draw_handle is None:
             _draw_handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_overlay, (), 'WINDOW', 'POST_PIXEL')
     else:
         if _draw_handle is not None:
             bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
             _draw_handle = None
+
+def update_icp_preview_overlay(self, context):
+    global _icp_draw_handle
+    if self.show_preview_overlay:
+        camera = context.scene.camera
+        if camera and hasattr(camera, "pinsolver_data") and camera.pinsolver_data.show_overlays:
+            camera.pinsolver_data.show_overlays = False
+        if _icp_draw_handle is None:
+            _icp_draw_handle = bpy.types.SpaceView3D.draw_handler_add(draw_callback_icp_overlay, (), 'WINDOW', 'POST_VIEW')
+    else:
+        if _icp_draw_handle is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(_icp_draw_handle, 'WINDOW')
+            _icp_draw_handle = None
+
+def update_icp_selected_object(self, context):
+    if _icp_object_change_guard:
+        return
+    reset_icp_for_object_change(self, context)
+
+def update_icp_quality_preset(self, context):
+    if self.icp_quality_preset == 'CUSTOM':
+        return
+    presets = {
+        'FAST': (1500, 3000, 20, 0.0005, 0.15, 2.0, 0.65, 2, 'AUTO', 0.30, 0.35),
+        'BALANCED': (3500, 7000, 40, 0.0001, 0.1, 2.5, 0.75, 3, 'AUTO', 0.45, 0.50),
+        'ACCURATE': (8000, 16000, 70, 0.00005, 0.05, 3.0, 0.80, 3, 'AUTO', 0.55, 0.55),
+        'FINE': (6000, 11000, 55, 0.00002, 0.04, 3.5, 0.90, 3, 'AUTO', 0.70, 0.20),
+    }
+    values = presets.get(self.icp_quality_preset)
+    if not values:
+        return
+    self.source_sample_count, self.target_sample_count, self.iterations, self.tolerance, self.max_correspondence_distance, self.rejection_scale, self.trim_fraction, self.pyramid_levels, self.icp_refinement_method, self.icp_tangent_weight, self.icp_coverage_balance = values
 
 class PinSolverData(PropertyGroup):
     picking_state: EnumProperty(items=[('NONE', "", ""), ('PICK_2D', "", ""), ('PICK_3D', "", "")], default='NONE')
@@ -703,7 +809,7 @@ class PinSolverData(PropertyGroup):
         soft_min=0.0,
         soft_max=2.0,
         subtype='FACTOR',
-        description="Adjust the strength of the selected location filter mode"
+        description="Increase curve repair and final location smoothing after refinement"
     )
     sequence_guided_location_strength: FloatProperty(
         name="Guide Strength",
@@ -784,6 +890,166 @@ class PinSolverData(PropertyGroup):
         default='MEDIAN'
     )
     use_dynamic_zoom: BoolProperty(name="Zooming", default=False, description="Keyframe this to toggle between Static lens and Dynamic Zoom per frame")
+
+class PinSolverICPPin(PropertyGroup):
+    name: StringProperty(name="Name", default="Align Pin")
+    source_pos_3d: FloatVectorProperty(name="Source", size=3, default=(0.0, 0.0, 0.0), description="Source object correspondence point in world space")
+    target_pos_3d: FloatVectorProperty(name="Target", size=3, default=(0.0, 0.0, 0.0), description="Target object correspondence point in world space")
+    source_pos_local: FloatVectorProperty(name="Source Local", size=3, default=(0.0, 0.0, 0.0), options={'HIDDEN'})
+    target_pos_local: FloatVectorProperty(name="Target Local", size=3, default=(0.0, 0.0, 0.0), options={'HIDDEN'})
+    color: FloatVectorProperty(name="Color", subtype='COLOR', size=4, default=(1.0, 0.2, 0.2, 1.0), min=0.0, max=1.0, description="Color for this ICP alignment pin pair")
+    has_source: BoolProperty(name="Source Set", default=False)
+    has_target: BoolProperty(name="Target Set", default=False)
+    has_source_local: BoolProperty(default=False, options={'HIDDEN'})
+    has_target_local: BoolProperty(default=False, options={'HIDDEN'})
+
+class PinSolverICPSettings(PropertyGroup):
+    source_object: PointerProperty(type=bpy.types.Object, name="Source", description="Mesh object to align", update=update_icp_selected_object)
+    target_object: PointerProperty(type=bpy.types.Object, name="Target", description="Mesh object to align the source to", update=update_icp_selected_object)
+    alignment_pins: CollectionProperty(type=PinSolverICPPin)
+    alignment_pin_idx: IntProperty(default=0, description="Active ICP Alignment Pin")
+    alignment_pick_role: EnumProperty(
+        items=[('NONE', "None", ""), ('SOURCE', "Source", ""), ('TARGET', "Target", "")],
+        default='NONE',
+        options={'SKIP_SAVE'}
+    )
+    alignment_pick_index: IntProperty(default=-1, options={'SKIP_SAVE'})
+    use_icp_scale_correction: BoolProperty(
+        name="Pin Scale",
+        default=False,
+        description="Estimate uniform scale from Alignment Pins before ICP refinement"
+    )
+    use_icp_scale_refinement: BoolProperty(
+        name="ICP Scale",
+        default=False,
+        description="Allow ICP refinement to estimate uniform scale in addition to rotation and translation"
+    )
+    show_icp_pin_coordinates: BoolProperty(name="Pin Coordinates", default=False, description="Show numeric ICP alignment pin coordinates")
+    show_icp_advanced: BoolProperty(name="Advanced", default=False, description="Show detailed ICP geometry and solver settings")
+    icp_quality_preset: EnumProperty(
+        name="Quality",
+        items=[
+            ('AUTO', "Auto", "Choose samples and correspondence distance from the selected meshes"),
+            ('FAST', "Fast", "Lower sample counts for quick previews"),
+            ('BALANCED', "Balanced", "Default quality and speed"),
+            ('ACCURATE', "Accurate", "Higher sample counts and iterations"),
+            ('FINE', "Fine", "Tighter final alignment for identical or very similar meshes"),
+            ('CUSTOM', "Custom", "Use the Advanced settings directly")
+        ],
+        default='AUTO',
+        update=update_icp_quality_preset
+    )
+    
+    use_evaluated_source: BoolProperty(name="Evaluated Source", default=True, description="Use source mesh after modifiers")
+    use_evaluated_target: BoolProperty(name="Evaluated Target", default=True, description="Use target mesh after modifiers")
+    source_mask_mode: EnumProperty(
+        name="Source Mask",
+        items=[
+            ('OFF', "Off", "Use the whole Source mesh"),
+            ('SELECTED_FACES', "Selected Faces", "Use only selected Source faces"),
+            ('SELECTED_VERTICES', "Selected Vertices", "Use only Source faces whose vertices are all selected"),
+            ('VERTEX_GROUP', "Vertex Group", "Use only Source faces whose vertices are all in the selected Vertex Group")
+        ],
+        default='OFF'
+    )
+    source_vertex_group_name: StringProperty(name="Source Vertex Group", default="", description="Vertex Group used as the Source ICP mask")
+    target_selected_faces_only: BoolProperty(name="Target Selected Faces", default=False, description="Use only selected target faces")
+    
+    source_sample_count: IntProperty(name="Source Samples", default=5000, min=100, max=200000)
+    target_sample_count: IntProperty(name="Target Samples", default=10000, min=100, max=300000)
+    random_seed: IntProperty(name="Seed", default=0, min=0)
+    
+    iterations: IntProperty(name="Iterations", default=40, min=1, max=500)
+    tolerance: FloatProperty(name="Tolerance", default=0.0001, min=1e-8, precision=6)
+    use_max_correspondence_distance: BoolProperty(name="Use Max Distance", default=True)
+    max_correspondence_distance: FloatProperty(name="Max Distance", default=0.1, min=1e-8, subtype='DISTANCE')
+    rejection_scale: FloatProperty(name="Outlier Rejection", default=2.5, min=0.0, max=20.0)
+    icp_refinement_method: EnumProperty(
+        name="Refinement",
+        items=[
+            ('AUTO', "Auto", "Use point-to-point ICP first, then hybrid surface refinement when target normals are available"),
+            ('POINT_TO_POINT', "Point-to-Point", "Use point-to-point ICP only"),
+            ('POINT_TO_PLANE', "Point-to-Plane", "Use hybrid point-to-plane refinement on the final ICP stage")
+        ],
+        default='AUTO'
+    )
+    icp_tangent_weight: FloatProperty(
+        name="Surface Lock",
+        default=0.45,
+        min=0.0,
+        max=2.0,
+        soft_min=0.0,
+        soft_max=1.0,
+        subtype='FACTOR',
+        description="Strength of tangential surface matching during point-to-plane refinement"
+    )
+    icp_coverage_balance: FloatProperty(
+        name="Coverage Balance",
+        default=0.50,
+        min=0.0,
+        max=1.0,
+        soft_min=0.0,
+        soft_max=1.0,
+        subtype='FACTOR',
+        description="Prefer correspondences spread across the common target area instead of letting one local patch dominate"
+    )
+    trim_fraction: FloatProperty(
+        name="Overlap",
+        default=0.75,
+        min=0.05,
+        max=1.0,
+        soft_min=0.2,
+        soft_max=1.0,
+        subtype='FACTOR',
+        description="Keep only the closest correspondence fraction each ICP iteration to reduce pull from non-overlapping areas"
+    )
+    pyramid_levels: IntProperty(
+        name="Coarse Levels",
+        default=3,
+        min=1,
+        max=3,
+        description="Run ICP from coarse samples to finer samples for faster convergence on large meshes"
+    )
+    icp_pin_radius: IntProperty(name="Pin Radius", default=6, min=1, max=30, description="Radius of ICP alignment pins")
+    icp_active_pin_radius: IntProperty(name="Active Pin Radius", default=9, min=1, max=40, description="Radius of the active ICP alignment pin")
+    icp_line_width: FloatProperty(name="Line Width", default=1.5, min=0.1, max=10.0, description="Width of ICP alignment pin connection lines")
+    icp_line_opacity: FloatProperty(name="Line Opacity", default=0.7, min=0.0, max=1.0, description="Opacity of ICP alignment pin connection lines")
+    
+    show_preview_overlay: BoolProperty(
+        name="Show ICP Preview",
+        default=False,
+        options={'SKIP_SAVE'},
+        update=update_icp_preview_overlay,
+        description="Show Alignment Pins; enabling this disables the main PinSolver overlay"
+    )
+    has_preview: BoolProperty(default=False, options={'SKIP_SAVE'})
+    result_status: EnumProperty(
+        name="Status",
+        items=[
+            ('NONE', "None", ""),
+            ('RUNNING', "Running", ""),
+            ('PREVIEW', "Preview", ""),
+            ('WARNING', "Warning", ""),
+            ('APPLIED', "Applied", ""),
+            ('REVERTED', "Reverted", ""),
+            ('CANCELLED', "Cancelled", ""),
+            ('ERROR', "Error", "")
+        ],
+        default='NONE',
+        options={'SKIP_SAVE'}
+    )
+    result_message: StringProperty(name="Message", default="", options={'SKIP_SAVE'})
+    result_residual: FloatProperty(name="Residual", default=-1.0, precision=6, options={'SKIP_SAVE'})
+    result_translation: FloatProperty(name="Translation", default=0.0, subtype='DISTANCE', precision=5, options={'SKIP_SAVE'})
+    result_rotation_degrees: FloatProperty(name="Rotation", default=0.0, precision=4, options={'SKIP_SAVE'})
+    result_source_points: IntProperty(name="Source Points", default=0, options={'SKIP_SAVE'})
+    result_target_points: IntProperty(name="Target Points", default=0, options={'SKIP_SAVE'})
+    result_elapsed_seconds: FloatProperty(name="Time", default=-1.0, precision=3, options={'SKIP_SAVE'})
+    result_confidence: FloatProperty(name="Confidence", default=-1.0, min=-1.0, max=1.0, precision=3, options={'SKIP_SAVE'})
+    result_overlap_ratio: FloatProperty(name="Overlap", default=0.0, min=0.0, max=1.0, precision=3, options={'SKIP_SAVE'})
+    result_p95_residual: FloatProperty(name="P95 Residual", default=-1.0, precision=6, options={'SKIP_SAVE'})
+    result_coverage_ratio: FloatProperty(name="Coverage", default=0.0, min=0.0, max=1.0, precision=3, options={'SKIP_SAVE'})
+    is_icp_running: BoolProperty(default=False, options={'SKIP_SAVE'})
 
 # ==========================================
 # 2. Core Solver Logic
@@ -932,8 +1198,9 @@ def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[An
             cam_data_ref = camera_obj.data
             if cam_data.target_clip:
                 trk_cam = cam_data.target_clip.tracking.camera
-                if cam_data.calib_focal_length or zoom_base_intrinsics is not None: 
+                if cam_data.calib_focal_length:
                     trk_cam.focal_length_pixels = float(camintr_new[0, 0])
+                    camera_obj.data.lens = trk_cam.focal_length
                 if cam_data.calib_optical_center:
                     cx_cv = float(camintr_new[0, 2])
                     cy_cv = float(camintr_new[1, 2])
@@ -944,12 +1211,10 @@ def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[An
                 if cam_data.calib_k1 and zoom_base_intrinsics is None: trk_cam.k1 = float(distcoef_new[0])
                 if cam_data.calib_k2 and zoom_base_intrinsics is None: trk_cam.k2 = float(distcoef_new[1])
                 if cam_data.calib_k3 and zoom_base_intrinsics is None: trk_cam.k3 = float(distcoef_new[4])
-                if cam_data.calib_focal_length or zoom_base_intrinsics is not None: 
-                    cam_data_ref.lens = cam_data.target_clip.tracking.camera.focal_length
             else:
                 max_res = max(res_x, res_y)
                 sw = cam_data_ref.sensor_height * (res_x / res_y) if cam_data_ref.sensor_fit == 'VERTICAL' else cam_data_ref.sensor_width
-                if cam_data.calib_focal_length or zoom_base_intrinsics is not None:
+                if cam_data.calib_focal_length:
                     cam_data_ref.lens = float(camintr_new[0, 0]) * max(1e-4, sw) / res_x
                 if cam_data.calib_optical_center:
                     cx = float(camintr_new[0, 2])
@@ -1020,18 +1285,154 @@ def _estimate_pose(obj_pts: np.ndarray, img_pts: np.ndarray, camintr: np.ndarray
 
     R_inv = cv2.Rodrigues(rvec_out)[0].T
     cam_pos = (-np.dot(R_inv, tvec_out)).flatten()
-    
-    if not np.isfinite(cam_pos).all() or np.linalg.norm(cam_pos) > 1e6: 
+
+    if not np.isfinite(cam_pos).all() or np.linalg.norm(cam_pos) > 1e6:
         return False, None, "Invalid Matrix Result"
-        
+
     R_blender = np.dot(R_inv, np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float64))
     mat_loc = Matrix.Translation(Vector((cam_pos[0], cam_pos[1], cam_pos[2])))
     return True, mat_loc @ Matrix(R_blender).to_4x4(), ""
+
+def opencv_pose_to_blender_matrix(rvec: np.ndarray, tvec: np.ndarray) -> Optional[Matrix]:
+    try:
+        rvec = np.asarray(rvec, dtype=np.float64).reshape(3, 1)
+        tvec = np.asarray(tvec, dtype=np.float64).reshape(3, 1)
+        R_inv = cv2.Rodrigues(rvec)[0].T
+        cam_pos = (-np.dot(R_inv, tvec)).flatten()
+        if not np.isfinite(cam_pos).all() or np.linalg.norm(cam_pos) > 1e6:
+            return None
+        R_blender = np.dot(R_inv, np.array([[1, 0, 0], [0, -1, 0], [0, 0, -1]], dtype=np.float64))
+        return Matrix.Translation(Vector(tuple(cam_pos))) @ Matrix(R_blender).to_4x4()
+    except Exception:
+        return None
 
 def get_camera_unscaled_matrix(camera_obj: bpy.types.Object, depsgraph: Any = None) -> Matrix:
     eval_cam = camera_obj.evaluated_get(depsgraph) if depsgraph else camera_obj
     cam_loc, cam_rot, _ = eval_cam.matrix_world.decompose()
     return Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
+
+def get_object_matrix_for_interactive_solve(obj: bpy.types.Object, depsgraph: Any, use_live_matrix: bool) -> Matrix:
+    if use_live_matrix:
+        return obj.matrix_world.copy()
+    return obj.evaluated_get(depsgraph).matrix_world.copy()
+
+def is_auto_keying_enabled(context: bpy.types.Context) -> bool:
+    tool_settings = getattr(context.scene, "tool_settings", None)
+    if not tool_settings:
+        return False
+    return bool(
+        getattr(tool_settings, "use_keyframe_insert_auto", False) or
+        getattr(tool_settings, "use_keyframe_insert", False) or
+        getattr(tool_settings, "use_keyframe_insert_keyingset", False)
+    )
+
+def get_rotation_key_path(obj: bpy.types.Object) -> str:
+    if obj.rotation_mode == 'QUATERNION':
+        return "rotation_quaternion"
+    if obj.rotation_mode == 'AXIS_ANGLE':
+        return "rotation_axis_angle"
+    return "rotation_euler"
+
+def action_fcurves_for_datablock(id_block: Any) -> List[Any]:
+    anim_data = getattr(id_block, "animation_data", None)
+    action = getattr(anim_data, "action", None) if anim_data else None
+    if not action:
+        return []
+        
+    legacy_fcurves = getattr(action, "fcurves", None)
+    if legacy_fcurves is not None:
+        try:
+            return list(legacy_fcurves)
+        except Exception:
+            return []
+            
+    action_slot = getattr(anim_data, "action_slot", None)
+    if action_slot is None:
+        suitable_slots = getattr(anim_data, "action_suitable_slots", None)
+        if suitable_slots:
+            try:
+                action_slot = suitable_slots[0]
+            except Exception:
+                action_slot = None
+    if action_slot is None:
+        slots = getattr(action, "slots", None)
+        if slots:
+            try:
+                action_slot = slots[0]
+            except Exception:
+                action_slot = None
+    if action_slot is None:
+        return []
+        
+    try:
+        from bpy_extras import anim_utils
+        channelbag = anim_utils.action_get_channelbag_for_slot(action, action_slot)
+        if channelbag and getattr(channelbag, "fcurves", None) is not None:
+            return list(channelbag.fcurves)
+    except Exception:
+        pass
+        
+    try:
+        layers = getattr(action, "layers", [])
+        for layer in layers:
+            for strip in getattr(layer, "strips", []):
+                channelbag_fn = getattr(strip, "channelbag", None)
+                if not channelbag_fn:
+                    continue
+                try:
+                    channelbag = channelbag_fn(action_slot)
+                except TypeError:
+                    channelbag = channelbag_fn(action_slot, ensure=False)
+                if channelbag and getattr(channelbag, "fcurves", None) is not None:
+                    return list(channelbag.fcurves)
+    except Exception:
+        pass
+        
+    return []
+
+def keyed_fcurves_for_path(id_block: Any, data_path: str) -> List[Any]:
+    return [fc for fc in action_fcurves_for_datablock(id_block) if fc.data_path == data_path and len(fc.keyframe_points) > 0]
+
+def key_existing_array_channels(id_block: Any, data_path: str, frame: int) -> int:
+    keyed_count = 0
+    keyed_indices = sorted({fc.array_index for fc in keyed_fcurves_for_path(id_block, data_path)})
+    for index in keyed_indices:
+        try:
+            if id_block.keyframe_insert(data_path=data_path, index=index, frame=frame):
+                keyed_count += 1
+        except Exception:
+            pass
+    return keyed_count
+
+def key_existing_scalar_channel(id_block: Any, data_path: str, frame: int) -> int:
+    if not keyed_fcurves_for_path(id_block, data_path):
+        return 0
+    try:
+        return 1 if id_block.keyframe_insert(data_path=data_path, frame=frame) else 0
+    except Exception:
+        return 0
+
+def get_solve_transform_target(cam_data: Any, camera_obj: bpy.types.Object, target_obj: Optional[bpy.types.Object]) -> Optional[bpy.types.Object]:
+    if cam_data.solve_mode == 'OBJECT':
+        return target_obj
+    if cam_data.solve_mode == 'PARENT':
+        return camera_obj.parent if camera_obj else None
+    return camera_obj
+
+def auto_key_solve_result(context: bpy.types.Context, cam_data: Any, camera_obj: bpy.types.Object, target_obj: Optional[bpy.types.Object], include_camera_data: bool = False) -> int:
+    if not is_auto_keying_enabled(context):
+        return 0
+    frame = int(context.scene.frame_current)
+    keyed_count = 0
+    obj_to_key = get_solve_transform_target(cam_data, camera_obj, target_obj)
+    if obj_to_key:
+        keyed_count += key_existing_array_channels(obj_to_key, "location", frame)
+        keyed_count += key_existing_array_channels(obj_to_key, get_rotation_key_path(obj_to_key), frame)
+    if include_camera_data and camera_obj and camera_obj.data:
+        keyed_count += key_existing_scalar_channel(camera_obj.data, "lens", frame)
+        keyed_count += key_existing_scalar_channel(camera_obj.data, "shift_x", frame)
+        keyed_count += key_existing_scalar_channel(camera_obj.data, "shift_y", frame)
+    return keyed_count
 
 def disable_camera_solver_constraints(camera_obj: bpy.types.Object) -> int:
     if not camera_obj:
@@ -1222,11 +1623,11 @@ def stabilize_roll_pose_path(solved_pose_by_frame: Dict[int, Matrix], mode: str,
 def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condition_by_frame: Dict[int, float], pin_count_by_frame: Dict[int, int], mode: str, strength_factor: float = 1.0, hard_frames: Optional[Set[int]] = None, soft_anchor_pose_by_frame: Optional[Dict[int, Matrix]] = None) -> Dict[int, Matrix]:
     if mode == 'OFF' or len(solved_pose_by_frame) < 3:
         return {}
-        
+
     strength_factor = max(0.0, min(2.0, float(strength_factor)))
     if strength_factor <= 1e-6:
         return {}
-        
+
     hard_frames = hard_frames or set()
     soft_anchor_pose_by_frame = soft_anchor_pose_by_frame or {}
     frames = sorted(solved_pose_by_frame.keys())
@@ -1243,14 +1644,14 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
         for f, pose in soft_anchor_pose_by_frame.items()
         if f in loc_by_frame and f not in hard_frames and pose is not None
     }
-        
+
     step_lengths = []
     for a, b in zip(frames[:-1], frames[1:]):
         dt = max(1.0, float(b - a))
         step_lengths.append((loc_by_frame[b] - loc_by_frame[a]).length / dt)
     step_med = float(np.median(step_lengths)) if step_lengths else 0.0
     step_med = max(step_med, 1e-6)
-    
+
     residuals = {}
     for i in range(1, len(frames) - 1):
         f = frames[i]
@@ -1259,7 +1660,7 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
         factor = (f - prev_f) / max(1.0, next_f - prev_f)
         expected = loc_by_frame[prev_f].lerp(loc_by_frame[next_f], factor)
         residuals[f] = (loc_by_frame[f] - expected).length
-        
+
     if residuals:
         vals = np.array(list(residuals.values()), dtype=np.float64)
         resid_med = float(np.median(vals))
@@ -1267,7 +1668,7 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
     else:
         resid_med = 0.0
         resid_mad = 0.0
-        
+
     if mode == 'STRONG':
         resid_limit = max(step_med * 3.0, resid_med + resid_mad * 4.0)
         low_cond_limit = max(step_med * 1.8, resid_med + resid_mad * 2.5)
@@ -1280,7 +1681,7 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
         jump_limit = step_med * 8.0
         radius = 3
         base_strength = 0.45
-        
+
     outliers = set()
     for i in range(1, len(frames) - 1):
         f = frames[i]
@@ -1295,13 +1696,13 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
         if residual > resid_limit or (low_condition and residual > low_cond_limit):
             outliers.add(f)
             continue
-            
+
         prev_step = (loc_by_frame[f] - loc_by_frame[prev_f]).length / max(1.0, f - prev_f)
         next_step = (loc_by_frame[next_f] - loc_by_frame[f]).length / max(1.0, next_f - f)
         across_step = (loc_by_frame[next_f] - loc_by_frame[prev_f]).length / max(1.0, next_f - prev_f)
         if low_condition and prev_step > jump_limit and next_step > jump_limit and across_step < max(prev_step, next_step) * 0.35:
             outliers.add(f)
-    
+
     good_frames = [f for f in frames if f not in outliers]
     repaired_loc = dict(loc_by_frame)
     for f in sorted(outliers):
@@ -1316,7 +1717,7 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
             repaired_loc[f] = repaired_loc[max(prev_good)].copy()
         elif next_good:
             repaired_loc[f] = repaired_loc[min(next_good)].copy()
-    
+
     stabilized = {}
     for i, f in enumerate(frames):
         weighted = Vector((0.0, 0.0, 0.0))
@@ -1340,7 +1741,7 @@ def stabilize_location_pose_path(solved_pose_by_frame: Dict[int, Matrix], condit
                 anchor_strength = min(0.90, (0.70 if mode == 'STRONG' else 0.55) * strength_factor)
                 final_loc = final_loc.lerp(soft_anchor_loc_by_frame[f], anchor_strength)
         stabilized[f] = Matrix.LocRotScale(final_loc, rot_by_frame[f], scale_by_frame[f])
-        
+
     return stabilized
 
 def align_marker_reference_segments(solved_pose_by_frame: Dict[int, Matrix], marker_reference_pose_by_frame: Dict[int, Matrix], anchor_frames: Set[int]) -> Dict[int, Matrix]:
@@ -1388,7 +1789,7 @@ def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix
     fixed_frames = {f for f in fixed_frames if f in solved_pose_by_frame}
     if len(solved_pose_by_frame) < 3 or not fixed_frames:
         return {}
-        
+
     frames = sorted(solved_pose_by_frame.keys())
     frame_set = set(frames)
     fixed_sorted = sorted(fixed_frames)
@@ -1397,9 +1798,9 @@ def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix
     blend = min(1.0, (0.96 if mode == 'STRONG' else 0.86) * strength_factor)
     if blend <= 1e-6:
         return {}
-        
+
     reinforced = {}
-    
+
     def hermite(p0: Vector, p1: Vector, m0: Vector, m1: Vector, t: float) -> Vector:
         t = max(0.0, min(1.0, float(t)))
         t2 = t * t
@@ -1409,7 +1810,7 @@ def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix
         h01 = -2.0 * t3 + 3.0 * t2
         h11 = t3 - t2
         return p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11
-    
+
     def collect_side(anchor_f: int, anchor_index: int, direction: int) -> List[int]:
         side_indices = []
         idx = anchor_index + direction
@@ -1422,7 +1823,7 @@ def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix
             side_indices.append(idx)
             idx += direction
         return side_indices
-    
+
     def apply_side(anchor_f: int, side_indices: List[int], boundary_f: int, anchor_tangent_per_frame: Vector, boundary_tangent_scale: float):
         if not side_indices:
             return
@@ -1455,18 +1856,18 @@ def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix
             local_blend = min(1.0, blend * (0.82 + 0.18 * distance_weight))
             final_loc = target_loc if local_blend >= 0.999 else base_loc.lerp(target_loc, local_blend)
             reinforced[f] = Matrix.LocRotScale(final_loc, base_rot, base_scale)
-    
+
     for anchor_f in fixed_sorted:
         anchor_index = frames.index(anchor_f)
         left_indices = collect_side(anchor_f, anchor_index, -1)
         right_indices = collect_side(anchor_f, anchor_index, 1)
         if not left_indices and not right_indices:
             continue
-            
+
         left_boundary_f = frames[left_indices[-1]] if left_indices else None
         right_boundary_f = frames[right_indices[-1]] if right_indices else None
         anchor_loc, _, _ = solved_pose_by_frame[anchor_f].decompose()
-        
+
         if left_boundary_f is not None and right_boundary_f is not None:
             left_loc, _, _ = solved_pose_by_frame[left_boundary_f].decompose()
             right_loc, _, _ = solved_pose_by_frame[right_boundary_f].decompose()
@@ -1479,12 +1880,12 @@ def reinforce_fixed_reference_transitions(solved_pose_by_frame: Dict[int, Matrix
             anchor_tangent = (right_loc - anchor_loc) / max(1.0, float(right_boundary_f - anchor_f))
         anchor_tangent *= 0.18 if mode == 'STRONG' else 0.28
         boundary_tangent_scale = 0.35 if mode == 'STRONG' else 0.50
-        
+
         if left_boundary_f is not None:
             apply_side(anchor_f, left_indices, left_boundary_f, anchor_tangent, boundary_tangent_scale)
         if right_boundary_f is not None:
             apply_side(anchor_f, right_indices, right_boundary_f, anchor_tangent, boundary_tangent_scale)
-            
+
     return reinforced
 
 def smooth_guided_location_pose(pose: Matrix, guide_location: Vector, strength_factor: float) -> Matrix:
@@ -1497,7 +1898,13 @@ def smooth_guided_location_pose(pose: Matrix, guide_location: Vector, strength_f
     blend = min(0.85, 0.42 * strength_factor)
     return Matrix.LocRotScale(loc.lerp(guide_location, blend), rot, scale)
 
-def refine_rotation_for_fixed_location(context: bpy.types.Context, cam_data: Any, target_data: Any, base_pose: Matrix) -> Matrix:
+def refine_rotation_for_fixed_location(
+    context: bpy.types.Context,
+    cam_data: Any,
+    target_data: Any,
+    base_pose: Matrix,
+    pin_name_filter: Optional[Set[str]] = None
+) -> Matrix:
     if base_pose is None:
         return base_pose
         
@@ -1510,6 +1917,8 @@ def refine_rotation_for_fixed_location(context: bpy.types.Context, cam_data: Any
     
     for pin in pins:
         if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        if pin_name_filter is not None and pin.name not in pin_name_filter:
             continue
         p2d = get_current_pin_pos_2d(context, cam_data, pin)
         if p2d is None:
@@ -1632,7 +2041,44 @@ def replace_pose_location(pose: Matrix, location: Vector) -> Matrix:
     _, rot, scale = pose.decompose()
     return Matrix.LocRotScale(location, rot, scale)
 
-def pose_reprojection_error(context: bpy.types.Context, cam_data: Any, target_data: Any, pose: Matrix) -> float:
+def count_active_pose_pins(
+    context: bpy.types.Context,
+    cam_data: Any,
+    target_data: Any,
+    pin_names: Optional[Set[str]] = None
+) -> int:
+    pins, _ = get_pins(cam_data, target_data)
+    return sum(
+        1 for pin in pins
+        if pin.use_initial and pin.has_valid_3d and
+        (pin_names is None or pin.name in pin_names) and
+        get_current_pin_pos_2d(context, cam_data, pin) is not None
+    )
+
+def get_sequence_refine_pin_names(pins: Any, frame: int) -> Set[str]:
+    eligible = set()
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        if not getattr(pin, "is_auto_raycast_3d", False):
+            eligible.add(pin.name)
+            continue
+        activation_frame = int(getattr(pin, "auto_raycast_frame", -1))
+        if activation_frame < 0:
+            eligible.add(pin.name)
+            continue
+        direction = int(getattr(pin, "auto_raycast_direction", 0))
+        if (direction < 0 and frame < activation_frame) or (direction >= 0 and frame > activation_frame):
+            eligible.add(pin.name)
+    return eligible
+
+def pose_reprojection_error(
+    context: bpy.types.Context,
+    cam_data: Any,
+    target_data: Any,
+    pose: Matrix,
+    pin_names: Optional[Set[str]] = None
+) -> float:
     if pose is None or not HAS_OPENCV:
         return float("inf")
         
@@ -1642,6 +2088,8 @@ def pose_reprojection_error(context: bpy.types.Context, cam_data: Any, target_da
     camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
     for pin in pins:
         if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        if pin_names is not None and pin.name not in pin_names:
             continue
         p2d = get_current_pin_pos_2d(context, cam_data, pin)
         if p2d is None:
@@ -1692,6 +2140,109 @@ def get_pin_plane_hint(points: List[Vector]) -> Tuple[Optional[Vector], Optional
         return centroid, normal, planar
     except Exception:
         return centroid, None, False
+
+def deduplicate_pose_candidates(candidates: List[Matrix], max_candidates: int = 10) -> List[Matrix]:
+    unique = []
+    for pose in candidates:
+        if pose is None:
+            continue
+        if any(
+            get_pose_delta(existing, pose)[0] <= 1e-5 and
+            get_pose_delta(existing, pose)[1] <= np.deg2rad(0.01)
+            for existing in unique
+        ):
+            continue
+        unique.append(pose.copy())
+        if len(unique) >= max_candidates:
+            break
+    return unique
+
+def generate_matchmove_pose_candidates(
+    context: bpy.types.Context,
+    cam_data: Any,
+    target_data: Any,
+    camera_obj: bpy.types.Object,
+    reference_pose: Matrix,
+    include_subsets: bool = False,
+    max_candidates: int = 8,
+    pin_names: Optional[Set[str]] = None
+) -> Tuple[List[Matrix], bool]:
+    if not HAS_OPENCV or not camera_obj or not camera_obj.data:
+        return [], False
+
+    pins, _ = get_pins(cam_data, target_data)
+    valid_pins = []
+    valid_p2ds = []
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d:
+            continue
+        if pin_names is not None and pin.name not in pin_names:
+            continue
+        p2d = get_current_pin_pos_2d(context, cam_data, pin)
+        if p2d is not None:
+            valid_pins.append(pin)
+            valid_p2ds.append(p2d)
+    if len(valid_pins) < 3:
+        return [], False
+
+    camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
+    obj_pts = np.ascontiguousarray([list(pin.pos_3d) for pin in valid_pins], dtype=np.float64)
+    img_pts = np.ascontiguousarray(
+        [to_cv_pixel(p2d.x, p2d.y, res_x, res_y) for p2d in valid_p2ds],
+        dtype=np.float64
+    )
+    points = [Vector(pin.pos_3d) for pin in valid_pins]
+    centroid, plane_normal, is_planar = get_pin_plane_hint(points)
+    candidates = []
+
+    if is_planar and len(valid_pins) >= 4 and hasattr(cv2, 'SOLVEPNP_IPPE'):
+        try:
+            generic_result = cv2.solvePnPGeneric(
+                obj_pts, img_pts, camintr, distcoef, flags=cv2.SOLVEPNP_IPPE)
+            if generic_result and generic_result[0]:
+                for rvec, tvec in zip(generic_result[1], generic_result[2]):
+                    pose = opencv_pose_to_blender_matrix(rvec, tvec)
+                    if pose is not None:
+                        candidates.append(pose)
+        except Exception:
+            pass
+
+    try:
+        success, rvec, tvec = cv2.solvePnP(
+            obj_pts, img_pts, camintr, distcoef, flags=cv2.SOLVEPNP_SQPNP)
+        if success:
+            pose = opencv_pose_to_blender_matrix(rvec, tvec)
+            if pose is not None:
+                candidates.append(pose)
+    except Exception:
+        pass
+
+    if include_subsets and len(valid_pins) >= 5:
+        drop_indices = np.linspace(0, len(valid_pins) - 1, min(4, len(valid_pins)), dtype=int)
+        for drop_idx in sorted(set(int(i) for i in drop_indices)):
+            keep = np.arange(len(valid_pins)) != drop_idx
+            try:
+                success, rvec, tvec = cv2.solvePnP(
+                    obj_pts[keep], img_pts[keep], camintr, distcoef, flags=cv2.SOLVEPNP_SQPNP)
+                if success:
+                    pose = opencv_pose_to_blender_matrix(rvec, tvec)
+                    if pose is not None:
+                        candidates.append(pose)
+            except Exception:
+                continue
+
+    filtered = []
+    for pose in deduplicate_pose_candidates(candidates, max_candidates=max_candidates * 2):
+        if (
+            centroid is not None and reference_pose is not None and
+            pose_flip_penalty(
+                pose, reference_pose, points, centroid, plane_normal,
+                is_planar, True
+            ) >= 1000.0
+        ):
+            continue
+        filtered.append(pose)
+    return deduplicate_pose_candidates(filtered, max_candidates=max_candidates), is_planar
 
 def pose_forward_vector(pose: Matrix) -> Vector:
     return (pose.to_3x3() @ Vector((0.0, 0.0, -1.0))).normalized()
@@ -1777,7 +2328,214 @@ def choose_temporal_pose_candidate(context: bpy.types.Context, cam_data: Any, ta
     near_best.sort(key=lambda item: (item[5], item[6] * guide_strength + item[3] + item[4] * 10.0 + item[1] * 0.25, item[0]))
     return near_best[0][7].copy()
 
-def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_mode: str = 'initial', skip_calib: bool = False, initial_pose_matrix: Optional[Matrix] = None, allow_global_fallback: bool = True) -> Tuple[bool, Optional[Matrix]]:
+def find_low_quality_sequence_frames(
+    solved_pose_by_frame: Dict[int, Matrix],
+    condition_by_frame: Dict[int, float],
+    pin_count_by_frame: Dict[int, int],
+    fixed_frames: Set[int],
+    ambiguous_frames: Set[int]
+) -> Set[int]:
+    frames = sorted(solved_pose_by_frame)
+    low_quality = {
+        f for f in frames
+        if f not in fixed_frames and (
+            condition_by_frame.get(f, 1.0) >= 0.45 or
+            pin_count_by_frame.get(f, 0) < 5 or
+            f in ambiguous_frames
+        )
+    }
+    if len(frames) < 3:
+        return low_quality
+
+    step_lengths = []
+    for prev_f, next_f in zip(frames[:-1], frames[1:]):
+        dt = max(1.0, float(next_f - prev_f))
+        step = (solved_pose_by_frame[next_f].translation - solved_pose_by_frame[prev_f].translation).length / dt
+        if np.isfinite(step):
+            step_lengths.append(step)
+    median_step = float(np.median(step_lengths)) if step_lengths else 0.0
+
+    for index in range(1, len(frames) - 1):
+        f = frames[index]
+        if f in fixed_frames:
+            continue
+        prev_f = frames[index - 1]
+        next_f = frames[index + 1]
+        factor = (f - prev_f) / max(1.0, float(next_f - prev_f))
+        expected = interpolate_pose_matrices(
+            solved_pose_by_frame[prev_f], solved_pose_by_frame[next_f], factor)
+        loc_delta, rot_delta = get_pose_delta(expected, solved_pose_by_frame[f])
+        neighbor_span, _ = get_pose_delta(
+            solved_pose_by_frame[prev_f], solved_pose_by_frame[next_f])
+        loc_limit = max(1e-4, median_step * 4.0, neighbor_span * 1.5)
+        if loc_delta > loc_limit or rot_delta > np.deg2rad(18.0):
+            low_quality.add(f)
+    return low_quality
+
+def split_sequence_frame_windows(frames: List[int], selected_frames: Set[int]) -> List[List[int]]:
+    windows = []
+    current = []
+    for f in frames:
+        if f in selected_frames:
+            current.append(f)
+        elif current:
+            windows.append(current)
+            current = []
+    if current:
+        windows.append(current)
+    return windows
+
+def select_sequence_pose_candidate_path(
+    candidate_records_by_frame: Dict[int, List[Tuple[Matrix, float]]],
+    fallback_pose_by_frame: Dict[int, Matrix],
+    condition_by_frame: Dict[int, float],
+    pin_count_by_frame: Dict[int, int],
+    fixed_pose_by_frame: Dict[int, Matrix],
+    eligible_frames: Set[int],
+    mode: str,
+    strength_factor: float = 1.0
+) -> Dict[int, Matrix]:
+    all_frames = sorted(fallback_pose_by_frame)
+    eligible_frames = set(eligible_frames) - set(fixed_pose_by_frame)
+    if not eligible_frames or len(all_frames) < 2:
+        return {}
+
+    step_lengths = []
+    for prev_f, next_f in zip(all_frames[:-1], all_frames[1:]):
+        dt = max(1.0, float(next_f - prev_f))
+        step = (fallback_pose_by_frame[next_f].translation - fallback_pose_by_frame[prev_f].translation).length / dt
+        if np.isfinite(step) and step > 1e-8:
+            step_lengths.append(step)
+    median_step = float(np.median(step_lengths)) if step_lengths else 0.0
+    median_depth = float(np.median([pose.translation.length for pose in fallback_pose_by_frame.values()]))
+    location_scale = max(1e-4, median_step * 2.5, median_depth * 0.001)
+    strength = max(0.25, min(2.0, float(strength_factor)))
+    velocity_weight = (0.05 if mode == 'STRONG' else 0.025) * strength
+    acceleration_weight = (0.70 if mode == 'STRONG' else 0.38) * strength
+
+    def incremental_path_cost(index, pose, path_poses, path_frames, records):
+        f = path_frames[index]
+        frame_records = records[f]
+        min_error = min(error for _, error in frame_records)
+        pose_error = min(
+            frame_records,
+            key=lambda item: sum(get_pose_delta(item[0], pose))
+        )[1]
+        error_scale = max(0.75, min_error + 0.25)
+        total = min(20.0, max(0.0, pose_error - min_error) / error_scale)
+        quality = 1.0 + max(0.0, min(1.0, condition_by_frame.get(f, 0.0)))
+        if pin_count_by_frame.get(f, 0) < 5:
+            quality += 0.5
+        if index >= 1:
+            prev_f = path_frames[index - 1]
+            dt = max(1.0, float(f - prev_f))
+            loc_delta, rot_delta = get_pose_delta(path_poses[-1], pose)
+            velocity = loc_delta / (location_scale * dt)
+            angular_velocity = rot_delta / (np.deg2rad(8.0) * dt)
+            total += velocity_weight * quality * (
+                math.sqrt(1.0 + velocity * velocity) - 1.0 +
+                (math.sqrt(1.0 + angular_velocity * angular_velocity) - 1.0) * 0.5
+            )
+        if index >= 2:
+            older_f = path_frames[index - 2]
+            prev_f = path_frames[index - 1]
+            dt_prev = max(1.0, float(prev_f - older_f))
+            dt_curr = max(1.0, float(f - prev_f))
+            prev_velocity = (path_poses[-1].translation - path_poses[-2].translation) / dt_prev
+            curr_velocity = (pose.translation - path_poses[-1].translation) / dt_curr
+            loc_accel = (curr_velocity - prev_velocity).length / location_scale
+            _, prev_rot = get_pose_delta(path_poses[-2], path_poses[-1])
+            _, curr_rot = get_pose_delta(path_poses[-1], pose)
+            rot_accel = abs(curr_rot / dt_curr - prev_rot / dt_prev) / np.deg2rad(6.0)
+            total += acceleration_weight * quality * (
+                math.sqrt(1.0 + loc_accel * loc_accel) - 1.0 +
+                (math.sqrt(1.0 + rot_accel * rot_accel) - 1.0) * 0.65
+            )
+        return total
+
+    def complete_path_cost(path_frames, path_poses, records):
+        total = 0.0
+        prefix = []
+        for index, pose in enumerate(path_poses):
+            total += incremental_path_cost(index, pose, prefix, path_frames, records)
+            prefix.append(pose)
+        return total
+
+    selected = {}
+    for window in split_sequence_frame_windows(all_frames, eligible_frames):
+        first_index = all_frames.index(window[0])
+        last_index = all_frames.index(window[-1])
+        path_frames = list(window)
+        if first_index > 0:
+            path_frames.insert(0, all_frames[first_index - 1])
+        if last_index + 1 < len(all_frames):
+            path_frames.append(all_frames[last_index + 1])
+
+        records = {}
+        for f in path_frames:
+            fallback = fixed_pose_by_frame.get(f, fallback_pose_by_frame[f]).copy()
+            if f not in eligible_frames:
+                records[f] = [(fallback, 0.0)]
+                continue
+            candidates = []
+            for pose, error in candidate_records_by_frame.get(f, []):
+                if pose is not None and np.isfinite(error):
+                    candidates.append((pose.copy(), float(error)))
+            if not candidates:
+                continue
+            fallback_record = min(
+                candidates,
+                key=lambda item: sum(get_pose_delta(item[0], fallback))
+            )
+            fallback_error = fallback_record[1]
+            min_error = min(error for _, error in candidates)
+            allowed_increase = max(0.35, fallback_error * 0.10)
+            alternatives = [
+                (pose, error) for pose, error in candidates
+                if (
+                    error <= fallback_error + allowed_increase and
+                    error <= min_error + max(0.5, min_error * 0.15) and
+                    (
+                        get_pose_delta(pose, fallback)[0] > 1e-5 or
+                        get_pose_delta(pose, fallback)[1] > np.deg2rad(0.01)
+                    )
+                )
+            ]
+            alternatives.sort(key=lambda item: item[1])
+            records[f] = [(fallback.copy(), fallback_error)] + alternatives[:7]
+
+        if any(f not in records for f in path_frames):
+            continue
+
+        beam = [(0.0, [])]
+        for index, f in enumerate(path_frames):
+            next_beam = []
+            for cost, path in beam:
+                for pose, _ in records[f]:
+                    next_path = path + [pose.copy()]
+                    next_cost = cost + incremental_path_cost(index, pose, path, path_frames, records)
+                    next_beam.append((next_cost, next_path))
+            next_beam.sort(key=lambda item: item[0])
+            beam = next_beam[:24]
+            if not beam:
+                break
+        if not beam:
+            continue
+
+        best_cost, best_path = beam[0]
+        fallback_path = [fixed_pose_by_frame.get(f, fallback_pose_by_frame[f]).copy() for f in path_frames]
+        fallback_cost = complete_path_cost(path_frames, fallback_path, records)
+        if best_cost + 0.10 >= fallback_cost:
+            continue
+        for f, pose in zip(path_frames, best_path):
+            if f not in eligible_frames:
+                continue
+            loc_delta, rot_delta = get_pose_delta(fallback_pose_by_frame[f], pose)
+            if loc_delta > 1e-5 or rot_delta > np.deg2rad(0.01):
+                selected[f] = pose.copy()
+    return selected
+
+def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_mode: str = 'initial', skip_calib: bool = False, initial_pose_matrix: Optional[Matrix] = None, allow_global_fallback: bool = True, pin_name_filter: Optional[Set[str]] = None) -> Tuple[bool, Optional[Matrix]]:
     try:
         if not camera_obj or not camera_obj.data: return False, None
             
@@ -1787,7 +2545,7 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
         
         for p in pins:
             is_active = p.use_initial if cam_data.ui_mode == 'MATCHMOVE' else getattr(p, f"use_{target_mode}")
-            if is_active and p.has_valid_3d:
+            if is_active and p.has_valid_3d and (pin_name_filter is None or p.name in pin_name_filter):
                 p2d = get_current_pin_pos_2d(context, cam_data, p)
                 if p2d is not None:
                     valid_pins.append(p)
@@ -1801,8 +2559,8 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
             cam_mat_unscaled = Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
         else:
             depsgraph = context.evaluated_depsgraph_get()
-            eval_cam = camera_obj.evaluated_get(depsgraph)
-            cam_loc, cam_rot, _ = eval_cam.matrix_world.decompose()
+            cam_mat = get_object_matrix_for_interactive_solve(camera_obj, depsgraph, is_live_layout_tweak(cam_data))
+            cam_loc, cam_rot, _ = cam_mat.decompose()
             cam_mat_unscaled = Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
             
         target_data.last_error = ""
@@ -1859,18 +2617,19 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
 def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_obj: bpy.types.Object, result_matrix: Matrix, parent_camera_local_matrix: Optional[Matrix] = None) -> bool:
     try:
         depsgraph = context.evaluated_depsgraph_get()
-        eval_cam = camera_obj.evaluated_get(depsgraph)
+        use_live_matrix = is_live_layout_tweak(cam_data)
+        cam_world = get_object_matrix_for_interactive_solve(camera_obj, depsgraph, use_live_matrix)
         
-        cam_loc, cam_rot, cam_scale = eval_cam.matrix_world.decompose()
+        cam_loc, cam_rot, cam_scale = cam_world.decompose()
         M_cam_old_unscaled = Matrix.LocRotScale(cam_loc, cam_rot, Vector((1.0, 1.0, 1.0)))
         
         if cam_data.solve_mode == 'OBJECT':
-            eval_target = target_obj.evaluated_get(depsgraph)
+            target_world = get_object_matrix_for_interactive_solve(target_obj, depsgraph, use_live_matrix)
             try: delta_M = M_cam_old_unscaled @ result_matrix.inverted()
             except ValueError: return False
             
             orig_scale = target_obj.matrix_world.to_scale()
-            new_mat = delta_M @ eval_target.matrix_world
+            new_mat = delta_M @ target_world
             loc, rot, _ = new_mat.decompose()
             target_obj.matrix_world = Matrix.LocRotScale(loc, rot, orig_scale)
             pins, _ = get_pins(cam_data, target_data)
@@ -1880,10 +2639,9 @@ def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: A
         elif cam_data.solve_mode == 'PARENT':
             parent_obj = camera_obj.parent
             if not parent_obj: return False
-            eval_parent = parent_obj.evaluated_get(depsgraph)
             
-            M_parent_world = eval_parent.matrix_world.copy()
-            M_cam_world = eval_cam.matrix_world.copy()
+            M_parent_world = get_object_matrix_for_interactive_solve(parent_obj, depsgraph, use_live_matrix)
+            M_cam_world = cam_world.copy()
             
             if parent_camera_local_matrix is not None:
                 M_cam_local = parent_camera_local_matrix.copy()
@@ -2026,6 +2784,7 @@ class PINSOLVER_OT_add_pin(PinSolverBaseOperator):
         new_pin.color = (*colorsys.hsv_to_rgb((idx * 0.618) % 1.0, 0.85, 1.0), 1.0)
         new_pin.pos_2d = (0.5, 0.5)
         new_pin.has_valid_3d = True
+        set_pin_3d_provenance(new_pin, False)
         new_pin.reproj_error = -1.0 
         
         cam = context.scene.camera
@@ -2091,12 +2850,14 @@ class PINSOLVER_OT_solve(PinSolverBaseOperator):
             rv3d.view_perspective = 'CAMERA'
         cam_data.show_overlays = True
         if cam_data.target_clip:
-            sync_scene_camera_from_clip(context, cam_data)
+            sync_clip_camera_from_scene(context, cam_data)
             context.view_layer.update()
 
         success, result = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode=self.target_mode)
         if success and result:
             if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result):
+                context.view_layer.update()
+                auto_key_solve_result(context, cam_data, context.scene.camera, target_obj, include_camera_data=(cam_data.ui_mode in {'LAYOUT', 'MATCHMOVE'}))
                 schedule_error_update() 
         return {'FINISHED'}
 
@@ -2252,6 +3013,7 @@ class PINSOLVER_OT_pick_3d(PinSolverBaseOperator, PinSolverPickMixin):
             pins, _ = get_pins(cam_data, target_data)
             pins[self.target_index].pos_3d = loc
             pins[self.target_index].has_valid_3d = True 
+            set_pin_3d_provenance(pins[self.target_index], False)
         
     def invoke(self, context, event):
         return self.invoke_common(context, 'PICK_3D')
@@ -2296,6 +3058,7 @@ class PINSOLVER_OT_auto_raycast_single(Operator):
         if hit:
             pin.pos_3d = loc
             pin.has_valid_3d = True 
+            set_pin_3d_provenance(pin, False)
             update_reproj_errors(context, cam_data, target_data, force_update=True)
             redraw_all_3d_views(context)
             return {'FINISHED'}
@@ -2336,6 +3099,7 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
                     new_pin.name = f"Pin {idx + 1}"
                     new_pin.pos_3d = loc
                     new_pin.has_valid_3d = True 
+                    set_pin_3d_provenance(new_pin, False)
                     new_pin.reproj_error = -1.0 
                     
                     if cam_data.use_distortion_overlay:
@@ -2409,6 +3173,7 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
                     if hit: 
                         pin.pos_3d = loc
                         pin.has_valid_3d = True 
+                        set_pin_3d_provenance(pin, False)
                 
                 update_reproj_errors(context, cam_data, target_data, force_update=True)
                 redraw_all_3d_views(context)
@@ -2420,7 +3185,7 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
         return {'PASS_THROUGH'}
 
     def invoke(self, context, event):
-        cam_data, target_data, _ = get_active_target_data(context)
+        cam_data, target_data, target_obj = get_active_target_data(context)
         if not cam_data or not target_data: return {'CANCELLED'}
         
         if cam_data.is_edit_mode:
@@ -2444,6 +3209,9 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
     bl_description = "Interactively tweak alignment by dragging 3D pins, recalculating pose in real-time"
     bl_options = {'REGISTER', 'UNDO'}
     dragging_idx: IntProperty(default=-1)
+
+    def _auto_key_tweak_result(self, context, cam_data, target_obj):
+        auto_key_solve_result(context, cam_data, context.scene.camera, target_obj, include_camera_data=(cam_data.ui_mode in {'LAYOUT', 'MATCHMOVE'}))
 
     def _sync_other_pins_2d(self, context, cam_data, target_data, region, rv3d, ignore_idx=-1):
         if cam_data.ui_mode != 'LAYOUT': return
@@ -2477,19 +3245,36 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                     
                 pin.pos_2d = (px_d / res_x, 1.0 - (py_d / res_y))
 
+    def _mouse_layout_uv(self, context, cam_data, rx, ry, region, rv3d):
+        if cam_data.ui_mode != 'LAYOUT':
+            return None
+        if cam_data.use_distortion_overlay:
+            u_dist, v_dist = mouse_to_distorted_uv(context, rx, ry, region, rv3d)
+            return Vector((u_dist, v_dist))
+        bounds = get_camera_frame_bounds(context, region, rv3d)
+        if not bounds:
+            return None
+        bw = max(1e-4, bounds[2] - bounds[0])
+        bh = max(1e-4, bounds[3] - bounds[1])
+        return Vector(((rx - bounds[0]) / bw, (ry - bounds[1]) / bh))
+
     def _trigger_solve(self, context, cam_data, target_data, target_obj, is_dragging=False):
         mode = 'tweak' if is_dragging else 'initial'
         success, result = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode=mode)
+        applied = False
         if success and result:
             if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result):
+                applied = True
                 context.view_layer.update()
+                if is_dragging:
+                    self._auto_key_tweak_result(context, cam_data, target_obj)
         update_reproj_errors(context, cam_data, target_data, force_update=True)
         context.area.tag_redraw()
+        return applied
 
     def modal(self, context, event):
         cam_data, target_data, target_obj = get_active_target_data(context)
         if not cam_data or not target_data or not cam_data.is_tweak_mode: 
-            self._clean(context)
             return {'FINISHED'}
 
         if event.type == 'Z' and event.ctrl and event.value == 'PRESS':
@@ -2517,13 +3302,14 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                 direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
                 hit, loc = safe_ray_cast(context, origin, direction)
                 if hit:
-                    self._sync_other_pins_2d(context, cam_data, target_data, region, rv3d)
                     idx = len(pins)
                     new_pin = pins.add()
                     new_pin.name = f"Pin {idx + 1}"
                     new_pin.use_initial = False
+                    new_pin.use_tweak = True
                     new_pin.pos_3d = loc
                     new_pin.has_valid_3d = True
+                    set_pin_3d_provenance(new_pin, False)
                     new_pin.reproj_error = -1.0
                     
                     if cam_data.use_distortion_overlay:
@@ -2538,7 +3324,8 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                             
                     new_pin.color = (*colorsys.hsv_to_rgb((idx * 0.618) % 1.0, 0.85, 1.0), 1.0)
                     set_pin_idx(cam_data, target_data, idx)
-                    self._trigger_solve(context, cam_data, target_data, target_obj, is_dragging=False)
+                    update_reproj_errors(context, cam_data, target_data, force_update=True)
+                    redraw_all_3d_views(context)
                     bpy.ops.ed.undo_push(message="PinSolver: Add Pin")
                 return {'RUNNING_MODAL'}
             elif event.type in {'X', 'I', 'T'}:
@@ -2547,7 +3334,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                     if event.type == 'X' and cam_data.ui_mode == 'LAYOUT': pins.remove(hover_idx)
                     elif event.type == 'I': pins[hover_idx].use_initial = not pins[hover_idx].use_initial
                     elif event.type == 'T' and cam_data.ui_mode == 'LAYOUT': pins[hover_idx].use_tweak = not pins[hover_idx].use_tweak
-                    self._trigger_solve(context, cam_data, target_data, target_obj, is_dragging=False)
+                    self._trigger_solve(context, cam_data, target_data, target_obj, is_dragging=True)
                     bpy.ops.ed.undo_push(message="PinSolver: Tweak Pin")
                 return {'RUNNING_MODAL'}
 
@@ -2556,6 +3343,11 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                 closest_idx = get_closest_pin_index(context, cam_data, target_data, mouse_vec, mode_filter='TWEAK', is_tweak=True, region=region, rv3d=rv3d)
                 if closest_idx != -1:
                     self.dragging_idx = closest_idx
+                    mouse_uv = self._mouse_layout_uv(context, cam_data, rx, ry, region, rv3d)
+                    if mouse_uv is not None:
+                        self.drag_uv_offset = Vector(pins[closest_idx].pos_2d) - mouse_uv
+                    else:
+                        self.drag_uv_offset = Vector((0.0, 0.0))
                     set_pin_idx(cam_data, target_data, closest_idx)
                     self._sync_other_pins_2d(context, cam_data, target_data, region, rv3d, ignore_idx=closest_idx)
                     context.area.tag_redraw()
@@ -2564,6 +3356,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
             elif event.value == 'RELEASE':
                 if self.dragging_idx != -1:
                     self.dragging_idx = -1
+                    self.drag_uv_offset = Vector((0.0, 0.0))
                     bpy.ops.ed.undo_push(message="PinSolver: Move Pin")
                     return {'RUNNING_MODAL'}
                 return {'PASS_THROUGH'}
@@ -2572,19 +3365,15 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
             if self.dragging_idx < len(pins):
                 pin = pins[self.dragging_idx]
                 if cam_data.ui_mode == 'LAYOUT':
-                    if cam_data.use_distortion_overlay:
-                        u_dist, v_dist = mouse_to_distorted_uv(context, rx, ry, region, rv3d)
-                        pin.pos_2d = (u_dist, v_dist)
-                    else:
-                        bounds = get_camera_frame_bounds(context, region, rv3d)
-                        if bounds:
-                            bw = max(1e-4, bounds[2] - bounds[0])
-                            bh = max(1e-4, bounds[3] - bounds[1])
-                            pin.pos_2d = ((rx - bounds[0]) / bw, (ry - bounds[1]) / bh)
+                    mouse_uv = self._mouse_layout_uv(context, cam_data, rx, ry, region, rv3d)
+                    if mouse_uv is not None:
+                        uv = mouse_uv + getattr(self, "drag_uv_offset", Vector((0.0, 0.0)))
+                        pin.pos_2d = (uv.x, uv.y)
                 self._trigger_solve(context, cam_data, target_data, target_obj, is_dragging=True)
             return {'RUNNING_MODAL'}
             
         elif event.type in {'RIGHTMOUSE', 'ESC'}:
+            self._auto_key_tweak_result(context, cam_data, target_obj)
             cam_data.is_tweak_mode = False
             schedule_error_update()
             self._clean(context)
@@ -2593,12 +3382,14 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
         return {'PASS_THROUGH'}
 
     def invoke(self, context, event):
-        cam_data, target_data, _ = get_active_target_data(context)
+        cam_data, target_data, target_obj = get_active_target_data(context)
         if not cam_data or not target_data: return {'CANCELLED'}
         
         if cam_data.is_tweak_mode:
+            self._auto_key_tweak_result(context, cam_data, target_obj)
             cam_data.is_tweak_mode = False
             schedule_error_update()
+            self._clean(context)
             return {'FINISHED'}
             
         if cam_data.solve_mode == 'PARENT' and not context.scene.camera.parent: return {'CANCELLED'}
@@ -2616,6 +3407,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
         cam_data.is_edit_mode = False 
         cam_data.show_overlays = True 
         self.dragging_idx = -1
+        self.drag_uv_offset = Vector((0.0, 0.0))
         
         self._timer = context.window_manager.event_timer_add(0.02, window=context.window)
         
@@ -2623,12 +3415,12 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
         context.window_manager.modal_handler_add(self)
         redraw_all_3d_views(context)
         return {'RUNNING_MODAL'}
-        
+
     def _clean(self, context):
         if hasattr(self, '_timer') and self._timer:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
-
+        
 # ==========================================
 # 3.5. Matchmove Engine Operators
 # ==========================================
@@ -2720,6 +3512,7 @@ class PINSOLVER_OT_sync_trackers(Operator):
                 new_pin.is_track_linked = True
                 new_pin.use_initial = True
                 new_pin.has_valid_3d = False
+                set_pin_3d_provenance(new_pin, False)
                 new_pin.reproj_error = -1.0
                 
                 if len(t.markers) > 0:
@@ -2772,6 +3565,7 @@ class PINSOLVER_OT_auto_raycast(Operator):
             if hit:
                 pin.pos_3d = loc
                 pin.has_valid_3d = True 
+                set_pin_3d_provenance(pin, False)
                 hit_count += 1
                 
         update_reproj_errors(context, cam_data, target_data, force_update=True)
@@ -2856,6 +3650,10 @@ class PINSOLVER_OT_bake_animation(Operator):
                 existing_location_by_frame[f] = context.scene.camera.evaluated_get(depsgraph).matrix_world.translation.copy()
         
         pins, _ = get_pins(cam_data, target_data)
+        trusted_pin_names = {
+            p.name for p in pins
+            if p.use_initial and p.has_valid_3d and not getattr(p, "is_auto_raycast_3d", False)
+        }
         valid_pin_count = sum(1 for p in pins if p.use_initial and p.has_valid_3d)
         min_sequence_pins = 2 if use_existing_location else 4
         if valid_pin_count < min_sequence_pins:
@@ -2871,7 +3669,10 @@ class PINSOLVER_OT_bake_animation(Operator):
         
         cam_ref = context.scene.camera.data
         trk_cam = clip.tracking.camera
-        sync_scene_camera_from_clip(context, cam_data)
+        if cam_data.calib_animation_mode == 'ZOOM':
+            sync_clip_camera_from_scene(context, cam_data)
+        else:
+            sync_scene_camera_from_clip(context, cam_data)
         context.view_layer.update()
         
         # ----------------------------------------------------
@@ -2896,7 +3697,14 @@ class PINSOLVER_OT_bake_animation(Operator):
                 base_lens, base_sx, base_sy = cam_ref.lens, cam_ref.shift_x, cam_ref.shift_y
                 base_k1, base_k2, base_k3 = trk_cam.k1, trk_cam.k2, trk_cam.k3
                 
-        else: # ZOOM or CURRENT
+        elif cam_data.calib_animation_mode == 'ZOOM':
+            context.scene.frame_set(cam_data.reference_frame)
+            context.view_layer.update()
+            base_lens = cam_ref.lens
+            base_sx = cam_ref.shift_x
+            base_sy = cam_ref.shift_y
+            base_k1, base_k2, base_k3 = trk_cam.k1, trk_cam.k2, trk_cam.k3
+        else: # CURRENT
             context.scene.frame_set(cam_data.reference_frame)
             success, _ = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=not needs_calib)
             base_lens = cam_ref.lens
@@ -2905,7 +3713,10 @@ class PINSOLVER_OT_bake_animation(Operator):
             base_k1, base_k2, base_k3 = trk_cam.k1, trk_cam.k2, trk_cam.k3
         
         if cam_data.calib_animation_mode == 'STATIC':
-            cam_ref.lens = base_lens
+            if cam_data.calib_focal_length:
+                apply_lens_to_scene_and_clip(context.scene.camera, clip, base_lens)
+            else:
+                cam_ref.lens = base_lens
             cam_ref.shift_x = base_sx
             cam_ref.shift_y = base_sy
             trk_cam.k1, trk_cam.k2, trk_cam.k3 = base_k1, base_k2, base_k3
@@ -2940,6 +3751,8 @@ class PINSOLVER_OT_bake_animation(Operator):
         chain_prev2_pose = None
         chain_prev2_frame = None
         solved_pose_by_frame = {}
+        candidate_records_by_frame = {}
+        ambiguous_pose_frames = set()
         condition_by_frame = {}
         pin_count_by_frame = {}
         location_filter_strength = max(0.0, min(2.0, float(getattr(cam_data, "sequence_location_filter_strength", 1.0))))
@@ -2949,7 +3762,30 @@ class PINSOLVER_OT_bake_animation(Operator):
         effective_stabilize_mode = getattr(cam_data, "sequence_stabilize_mode", 'OFF')
         if location_filter_strength <= 1e-6:
             effective_stabilize_mode = 'OFF'
-        
+        use_candidate_path = motion_source == 'PNP' and effective_stabilize_mode != 'OFF'
+
+        def record_pose_candidates(f, candidates):
+            records = candidate_records_by_frame.setdefault(f, [])
+            trusted_count = count_active_pose_pins(
+                context, cam_data, target_data, trusted_pin_names)
+            error_pin_names = trusted_pin_names if trusted_count >= 2 else None
+            for pose in candidates:
+                if pose is None:
+                    continue
+                error = pose_reprojection_error(
+                    context, cam_data, target_data, pose, error_pin_names)
+                if not np.isfinite(error):
+                    continue
+                if any(
+                    get_pose_delta(existing_pose, pose)[0] <= 1e-5 and
+                    get_pose_delta(existing_pose, pose)[1] <= np.deg2rad(0.01)
+                    for existing_pose, _ in records
+                ):
+                    continue
+                records.append((pose.copy(), error))
+            if len(records) > 10:
+                records[:] = [records[0]] + sorted(records[1:], key=lambda item: item[1])[:9]
+
         def keyframe_current_target(f):
             obj_to_key = target_obj if cam_data.solve_mode == 'OBJECT' else context.scene.camera
             if cam_data.solve_mode == 'PARENT' and context.scene.camera.parent:
@@ -2988,9 +3824,12 @@ class PINSOLVER_OT_bake_animation(Operator):
                 hit, loc = raycast_pin_from_current_camera(context, cam_data, pin)
                 if not hit or loc is None:
                     continue
-                    
+
                 pin.pos_3d = loc
                 pin.has_valid_3d = True
+                raycast_frame = context.scene.frame_current
+                raycast_direction = 1 if raycast_frame >= cam_data.reference_frame else -1
+                set_pin_3d_provenance(pin, True, raycast_frame, raycast_direction)
                 ref_3d_pos[pin.name] = Vector(loc)
                 ref_local_pos[pin.name] = tgt_inv @ Vector(loc)
                 auto_raycasted_count += 1
@@ -3010,12 +3849,15 @@ class PINSOLVER_OT_bake_animation(Operator):
                     p.pos_3d = ref_3d_pos[p.name]
                 
             if needs_calib and cam_data.calib_animation_mode == 'ZOOM':
-                cam_ref.lens = base_lens
+                if cam_data.calib_focal_length:
+                    apply_lens_to_scene_and_clip(context.scene.camera, clip, base_lens)
+                else:
+                    cam_ref.lens = base_lens
                 cam_ref.shift_x = base_sx
                 cam_ref.shift_y = base_sy
                 trk_cam.k1, trk_cam.k2, trk_cam.k3 = base_k1, base_k2, base_k3
                 
-                if cam_data.use_dynamic_zoom:
+                if cam_data.use_dynamic_zoom and f != cam_data.reference_frame:
                     valid_pins = []
                     valid_p2ds = []
                     for p in pins:
@@ -3047,7 +3889,8 @@ class PINSOLVER_OT_bake_animation(Operator):
                             new_sx = (new_cx - res_x / 2.0) / max(res_x, res_y)
                             new_sy = (res_y / 2.0 - new_cy) / max(res_x, res_y)
                             
-                            if cam_data.calib_focal_length: cam_ref.lens = new_lens
+                            if cam_data.calib_focal_length:
+                                apply_lens_to_scene_and_clip(context.scene.camera, clip, new_lens)
                             if cam_data.calib_optical_center:
                                 cam_ref.shift_x = new_sx
                                 cam_ref.shift_y = new_sy
@@ -3068,6 +3911,8 @@ class PINSOLVER_OT_bake_animation(Operator):
                 condition_score, pin_count = get_solve_condition_score(context, cam_data, target_data)
                 condition_by_frame[f] = condition_score
                 pin_count_by_frame[f] = pin_count
+                if use_candidate_path:
+                    record_pose_candidates(f, [ref_result])
                 if keyframe_current_target(f):
                     success_count += 1
                 raycast_new_active_tracks_after_solve()
@@ -3128,9 +3973,61 @@ class PINSOLVER_OT_bake_animation(Operator):
                 )
                 if global_success and global_result:
                     candidates.append(global_result.copy())
-                    
+
+            sequence_candidates = list(candidates)
+            candidate_condition_score, candidate_pin_count = get_solve_condition_score(context, cam_data, target_data)
+            if use_candidate_path and candidates:
+                _, _, frame_is_planar = get_pin_plane_hint(
+                    get_active_pin_world_points(context, cam_data, target_data))
+                low_condition = candidate_condition_score >= 0.45 or candidate_pin_count < 5
+                if low_condition or frame_is_planar:
+                    trusted_sequence_candidates = []
+                    extra_candidates, frame_is_planar = generate_matchmove_pose_candidates(
+                        context,
+                        cam_data,
+                        target_data,
+                        context.scene.camera,
+                        prediction_pose if prediction_pose is not None else initial_pose,
+                        include_subsets=low_condition,
+                        max_candidates=8 if stabilize_mode == 'STRONG' else 6
+                    )
+                    sequence_candidates.extend(extra_candidates)
+                    trusted_active_count = count_active_pose_pins(
+                        context, cam_data, target_data, trusted_pin_names)
+                    if trusted_active_count >= 4:
+                        trusted_success, trusted_pose = solve_camera_pose(
+                            context,
+                            cam_data,
+                            target_data,
+                            context.scene.camera,
+                            target_mode='initial',
+                            skip_calib=True,
+                            initial_pose_matrix=prediction_pose if prediction_pose is not None else initial_pose,
+                            allow_global_fallback=False,
+                            pin_name_filter=trusted_pin_names
+                        )
+                        if trusted_success and trusted_pose:
+                            trusted_sequence_candidates.append(trusted_pose)
+                        if frame_is_planar:
+                            trusted_candidates, _ = generate_matchmove_pose_candidates(
+                                context,
+                                cam_data,
+                                target_data,
+                                context.scene.camera,
+                                prediction_pose if prediction_pose is not None else initial_pose,
+                                include_subsets=low_condition,
+                                max_candidates=5,
+                                pin_names=trusted_pin_names
+                            )
+                            trusted_sequence_candidates.extend(trusted_candidates)
+                    sequence_candidates = deduplicate_pose_candidates(
+                        trusted_sequence_candidates + sequence_candidates,
+                        max_candidates=10
+                    )
+                    if frame_is_planar:
+                        ambiguous_pose_frames.add(f)
+
             if candidates:
-                candidate_condition_score, candidate_pin_count = get_solve_condition_score(context, cam_data, target_data)
                 chosen = choose_temporal_pose_candidate(
                     context, cam_data, target_data, initial_pose, candidates,
                     prediction_pose=prediction_pose,
@@ -3157,6 +4054,9 @@ class PINSOLVER_OT_bake_animation(Operator):
                 success = True
             
             if success and result:
+                condition_score, pin_count = get_solve_condition_score(context, cam_data, target_data)
+                if use_candidate_path:
+                    record_pose_candidates(f, [result] + sequence_candidates)
                 if apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, result, ref_parent_camera_local):
                     context.view_layer.update() 
                     chain_prev2_pose = chain_prev_pose.copy() if chain_prev_pose else None
@@ -3166,7 +4066,6 @@ class PINSOLVER_OT_bake_animation(Operator):
                     chain_pose = result.copy()
                     chain_frame = f
                     solved_pose_by_frame[f] = result.copy()
-                    condition_score, pin_count = get_solve_condition_score(context, cam_data, target_data)
                     condition_by_frame[f] = condition_score
                     pin_count_by_frame[f] = pin_count
                     if keyframe_current_target(f):
@@ -3200,6 +4099,91 @@ class PINSOLVER_OT_bake_animation(Operator):
         marker_anchor_frames = set(marker_reference_frames) if use_marker_references else set()
         marker_anchor_frames.add(cam_data.reference_frame)
         fixed_reference_frames = set(marker_anchor_frames) if use_marker_references else {cam_data.reference_frame}
+
+        if use_candidate_path and len(solved_pose_by_frame) >= 2:
+            low_quality_frames = find_low_quality_sequence_frames(
+                solved_pose_by_frame,
+                condition_by_frame,
+                pin_count_by_frame,
+                fixed_reference_frames,
+                ambiguous_pose_frames
+            )
+
+            if effective_stabilize_mode == 'STRONG' and low_quality_frames:
+                solved_frames = sorted(solved_pose_by_frame)
+                frame_index = {f: index for index, f in enumerate(solved_frames)}
+                for window in split_sequence_frame_windows(solved_frames, low_quality_frames):
+                    first_index = frame_index[window[0]]
+                    last_index = frame_index[window[-1]]
+                    if first_index == 0 or last_index + 1 >= len(solved_frames):
+                        continue
+                    prev_f = solved_frames[first_index - 1]
+                    next_f = solved_frames[last_index + 1]
+                    prev_pose = solved_pose_by_frame[prev_f]
+                    next_pose = solved_pose_by_frame[next_f]
+                    for f in window:
+                        factor = (f - prev_f) / max(1.0, float(next_f - prev_f))
+                        expected = interpolate_pose_matrices(prev_pose, next_pose, factor)
+                        context.scene.frame_set(f)
+                        context.view_layer.update()
+                        restore_sequence_pin_positions(
+                            context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                        refine_success, refined_pose = solve_camera_pose(
+                            context,
+                            cam_data,
+                            target_data,
+                            context.scene.camera,
+                            target_mode='initial',
+                            skip_calib=True,
+                            initial_pose_matrix=expected,
+                            allow_global_fallback=False
+                        )
+                        if refine_success and refined_pose:
+                            record_pose_candidates(f, [refined_pose])
+                        if count_active_pose_pins(
+                            context, cam_data, target_data, trusted_pin_names
+                        ) >= 4:
+                            trusted_refine_success, trusted_refined_pose = solve_camera_pose(
+                                context,
+                                cam_data,
+                                target_data,
+                                context.scene.camera,
+                                target_mode='initial',
+                                skip_calib=True,
+                                initial_pose_matrix=expected,
+                                allow_global_fallback=False,
+                                pin_name_filter=trusted_pin_names
+                            )
+                            if trusted_refine_success and trusted_refined_pose:
+                                record_pose_candidates(f, [trusted_refined_pose])
+
+            fixed_pose_by_frame = {
+                f: solved_pose_by_frame[f].copy()
+                for f in fixed_reference_frames
+                if f in solved_pose_by_frame
+            }
+            selected_pose_by_frame = select_sequence_pose_candidate_path(
+                candidate_records_by_frame,
+                solved_pose_by_frame,
+                condition_by_frame,
+                pin_count_by_frame,
+                fixed_pose_by_frame,
+                low_quality_frames,
+                effective_stabilize_mode,
+                location_filter_strength
+            )
+            for f in sorted(selected_pose_by_frame):
+                context.scene.frame_set(f)
+                restore_sequence_pin_positions(
+                    context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                selected_pose = selected_pose_by_frame[f]
+                if apply_solve_result(
+                    context, cam_data, target_data, context.scene.camera,
+                    target_obj, selected_pose, ref_parent_camera_local
+                ):
+                    context.view_layer.update()
+                    solved_pose_by_frame[f] = selected_pose.copy()
+                    keyframe_current_target(f)
         
         if use_marker_references:
             aligned_pose_by_frame = align_marker_reference_segments(solved_pose_by_frame, marker_reference_pose_by_frame, marker_anchor_frames)
@@ -3223,7 +4207,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 if ref_f in solved_pose_by_frame and ref_f not in anchor_frames:
                     anchor_frames.append(ref_f)
                 anchor_frames.sort()
-                
+
             bad_frames = set()
             for f in sorted_frames:
                 if f in fixed_reference_frames:
@@ -3256,7 +4240,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 low_condition = condition_score >= 0.45 or pin_count < 5
                 if low_condition and (loc_err > loc_limit or rot_err > rot_limit):
                     bad_frames.add(f)
-            
+
             if bad_frames:
                 for f in sorted(bad_frames):
                     prev_anchors = [af for af in anchor_frames if af < f]
@@ -3277,7 +4261,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                         context.view_layer.update()
                         solved_pose_by_frame[f] = repaired_pose.copy()
                         keyframe_current_target(f)
-            
+
             stabilized_pose_by_frame = stabilize_location_pose_path(
                 solved_pose_by_frame,
                 condition_by_frame,
@@ -3297,7 +4281,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                     context.view_layer.update()
                     solved_pose_by_frame[f] = corrected_pose.copy()
                     keyframe_current_target(f)
-            
+
             if use_marker_references:
                 reinforced_pose_by_frame = reinforce_fixed_reference_transitions(
                     solved_pose_by_frame,
@@ -3315,7 +4299,188 @@ class PINSOLVER_OT_bake_animation(Operator):
                         context.view_layer.update()
                         solved_pose_by_frame[f] = corrected_pose.copy()
                         keyframe_current_target(f)
-        
+
+        reraycast_refined_count = 0
+        second_pass_refined_count = 0
+        second_pass_refined_frames = set()
+        if use_candidate_path and auto_raycast_new_tracks and solved_pose_by_frame:
+            auto_pins_by_frame = {}
+            for pin in pins:
+                activation_frame = int(getattr(pin, "auto_raycast_frame", -1))
+                if (
+                    pin.use_initial and pin.has_valid_3d and
+                    getattr(pin, "is_auto_raycast_3d", False) and
+                    activation_frame in solved_pose_by_frame
+                ):
+                    auto_pins_by_frame.setdefault(activation_frame, []).append(pin)
+
+            def refine_and_reraycast_frame(f):
+                nonlocal reraycast_refined_count, second_pass_refined_count
+                context.scene.frame_set(f)
+                context.view_layer.update()
+                restore_sequence_pin_positions(
+                    context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+
+                if f not in fixed_reference_frames:
+                    eligible_pin_names = get_sequence_refine_pin_names(pins, f)
+                    has_refit_auto_pin = any(
+                        getattr(pin, "is_auto_raycast_3d", False) and
+                        pin.name in eligible_pin_names
+                        for pin in pins
+                    )
+                    min_refine_pins = 3 if cam_data.use_planar_solve else 4
+                    if has_refit_auto_pin and count_active_pose_pins(
+                        context, cam_data, target_data, eligible_pin_names
+                    ) >= min_refine_pins:
+                        stable_pose = solved_pose_by_frame[f].copy()
+                        refine_success, refined_pose = solve_camera_pose(
+                            context,
+                            cam_data,
+                            target_data,
+                            context.scene.camera,
+                            target_mode='initial',
+                            skip_calib=True,
+                            initial_pose_matrix=stable_pose,
+                            allow_global_fallback=False,
+                            pin_name_filter=eligible_pin_names
+                        )
+                        accept_refined_pose = refine_success and refined_pose is not None
+                        if accept_refined_pose:
+                            stable_error = pose_reprojection_error(
+                                context, cam_data, target_data, stable_pose, eligible_pin_names)
+                            refined_error = pose_reprojection_error(
+                                context, cam_data, target_data, refined_pose, eligible_pin_names)
+                            accept_refined_pose = np.isfinite(refined_error)
+                            if (
+                                accept_refined_pose and np.isfinite(stable_error) and
+                                refined_error > stable_error + max(0.25, stable_error * 0.05)
+                            ):
+                                accept_refined_pose = False
+
+                        trusted_active_count = count_active_pose_pins(
+                            context, cam_data, target_data, trusted_pin_names)
+                        if accept_refined_pose and trusted_active_count >= 2:
+                            stable_trusted_error = pose_reprojection_error(
+                                context, cam_data, target_data, stable_pose, trusted_pin_names)
+                            refined_trusted_error = pose_reprojection_error(
+                                context, cam_data, target_data, refined_pose, trusted_pin_names)
+                            if (
+                                np.isfinite(stable_trusted_error) and
+                                np.isfinite(refined_trusted_error) and
+                                refined_trusted_error > stable_trusted_error + max(0.35, stable_trusted_error * 0.10)
+                            ):
+                                accept_refined_pose = False
+
+                        if accept_refined_pose:
+                            active_points = [
+                                Vector(pin.pos_3d) for pin in pins
+                                if (
+                                    pin.name in eligible_pin_names and
+                                    get_current_pin_pos_2d(context, cam_data, pin) is not None
+                                )
+                            ]
+                            centroid, plane_normal, is_planar = get_pin_plane_hint(active_points)
+                            if (
+                                centroid is not None and
+                                pose_flip_penalty(
+                                    refined_pose, stable_pose, active_points, centroid,
+                                    plane_normal, is_planar, True
+                                ) >= 1000.0
+                            ):
+                                accept_refined_pose = False
+
+                        if accept_refined_pose and apply_solve_result(
+                            context, cam_data, target_data, context.scene.camera,
+                            target_obj, refined_pose, ref_parent_camera_local
+                        ):
+                            context.view_layer.update()
+                            solved_pose_by_frame[f] = refined_pose.copy()
+                            keyframe_current_target(f)
+                            second_pass_refined_count += 1
+                            second_pass_refined_frames.add(f)
+
+                for pin in auto_pins_by_frame.get(f, []):
+                    hit, loc = raycast_pin_from_current_camera(context, cam_data, pin)
+                    if not hit or loc is None:
+                        continue
+                    depsgraph = context.evaluated_depsgraph_get()
+                    tgt_inv = Matrix.Identity(4)
+                    if target_obj:
+                        try:
+                            tgt_inv = target_obj.evaluated_get(depsgraph).matrix_world.inverted()
+                        except Exception:
+                            tgt_inv = Matrix.Identity(4)
+                    pin.pos_3d = loc
+                    ref_3d_pos[pin.name] = Vector(loc)
+                    ref_local_pos[pin.name] = tgt_inv @ Vector(loc)
+                    reraycast_refined_count += 1
+
+            for f in frames_forward:
+                if f in solved_pose_by_frame:
+                    refine_and_reraycast_frame(f)
+            for f in frames_backward:
+                if f in solved_pose_by_frame:
+                    refine_and_reraycast_frame(f)
+
+        if second_pass_refined_frames:
+            post_refine_pose_by_frame = stabilize_location_pose_path(
+                solved_pose_by_frame,
+                condition_by_frame,
+                pin_count_by_frame,
+                effective_stabilize_mode,
+                location_filter_strength,
+                fixed_reference_frames,
+                marker_reference_pose_by_frame if use_marker_references else None
+            )
+            for f in sorted(second_pass_refined_frames):
+                if f in fixed_reference_frames or f not in post_refine_pose_by_frame:
+                    continue
+                context.scene.frame_set(f)
+                restore_sequence_pin_positions(
+                    context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                corrected_pose = refine_rotation_for_fixed_location(
+                    context,
+                    cam_data,
+                    target_data,
+                    post_refine_pose_by_frame[f],
+                    get_sequence_refine_pin_names(pins, f)
+                )
+                if apply_solve_result(
+                    context, cam_data, target_data, context.scene.camera,
+                    target_obj, corrected_pose, ref_parent_camera_local
+                ):
+                    context.view_layer.update()
+                    solved_pose_by_frame[f] = corrected_pose.copy()
+                    keyframe_current_target(f)
+
+            if use_marker_references:
+                post_refine_reinforced_by_frame = reinforce_fixed_reference_transitions(
+                    solved_pose_by_frame,
+                    fixed_reference_frames,
+                    effective_stabilize_mode,
+                    location_filter_strength
+                )
+                for f in sorted(second_pass_refined_frames):
+                    if f in fixed_reference_frames or f not in post_refine_reinforced_by_frame:
+                        continue
+                    context.scene.frame_set(f)
+                    restore_sequence_pin_positions(
+                        context, cam_data, target_obj, pins, ref_3d_pos, ref_local_pos)
+                    corrected_pose = refine_rotation_for_fixed_location(
+                        context,
+                        cam_data,
+                        target_data,
+                        post_refine_reinforced_by_frame[f],
+                        get_sequence_refine_pin_names(pins, f)
+                    )
+                    if apply_solve_result(
+                        context, cam_data, target_data, context.scene.camera,
+                        target_obj, corrected_pose, ref_parent_camera_local
+                    ):
+                        context.view_layer.update()
+                        solved_pose_by_frame[f] = corrected_pose.copy()
+                        keyframe_current_target(f)
+
         roll_smoothed_pose_by_frame = stabilize_roll_pose_path(
             solved_pose_by_frame,
             getattr(cam_data, "sequence_roll_smoothing", 'OFF'),
@@ -3330,7 +4495,6 @@ class PINSOLVER_OT_bake_animation(Operator):
                 context.view_layer.update()
                 solved_pose_by_frame[f] = roll_smoothed_pose_by_frame[f].copy()
                 keyframe_current_target(f)
-            
         # ----------------------------------------------------
         # Pass 3 - Evaluation of raw OpenCV data after the process has fully completed
         # ----------------------------------------------------
@@ -3386,8 +4550,1048 @@ class PINSOLVER_OT_bake_animation(Operator):
         disabled_solver_count = disable_camera_solver_constraints(context.scene.camera)
         final_err_msg = f" | Seq Avg Error: {(total_reproj_error/success_count):.2f} px" if success_count > 0 else ""
         raycast_msg = f" | Auto Raycast: {auto_raycasted_count}" if auto_raycasted_count > 0 else ""
+        reraycast_msg = f" | Reprojected: {reraycast_refined_count}" if reraycast_refined_count > 0 else ""
+        refine_msg = f" | PnP Refined: {second_pass_refined_count}" if second_pass_refined_count > 0 else ""
         solver_msg = " | Camera Solver disabled" if disabled_solver_count > 0 else ""
-        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + solver_msg)
+        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + reraycast_msg + refine_msg + solver_msg)
+        return {'FINISHED'}
+
+# ==========================================
+# 3.6. ICP Model Alignment Operators
+# ==========================================
+def clear_icp_runtime_state() -> None:
+    _icp_runtime_state["original_source_matrix"] = None
+    _icp_runtime_state["preview_source_matrix"] = None
+    _icp_runtime_state["result_transform"] = None
+    _icp_runtime_state["source_fingerprint"] = None
+    _icp_runtime_state["target_fingerprint"] = None
+    _icp_runtime_state["cancel_event"] = None
+    _icp_runtime_state["owner_scene"] = None
+    _icp_runtime_state["owner_source"] = None
+    _icp_runtime_state["owner_target"] = None
+    _icp_runtime_state["input_invalidated"] = False
+
+def set_icp_status(icp_data, status: str, message: str = "", residual: float = -1.0, translation: float = 0.0, rotation: float = 0.0, source_points: int = 0, target_points: int = 0, elapsed_seconds: float = -1.0, confidence: float = -1.0, overlap_ratio: float = 0.0, p95_residual: float = -1.0, coverage_ratio: float = 0.0) -> None:
+    icp_data.result_status = status
+    icp_data.result_message = message
+    icp_data.result_residual = float(residual)
+    icp_data.result_translation = float(translation)
+    icp_data.result_rotation_degrees = float(rotation)
+    icp_data.result_source_points = int(source_points)
+    icp_data.result_target_points = int(target_points)
+    icp_data.result_elapsed_seconds = float(elapsed_seconds)
+    icp_data.result_confidence = float(confidence)
+    icp_data.result_overlap_ratio = float(overlap_ratio)
+    icp_data.result_p95_residual = float(p95_residual)
+    icp_data.result_coverage_ratio = float(coverage_ratio)
+
+def clear_icp_pick_state(icp_data) -> None:
+    icp_data.alignment_pick_role = 'NONE'
+    icp_data.alignment_pick_index = -1
+
+def is_valid_icp_rna(value: Any) -> bool:
+    if value is None:
+        return False
+    try:
+        value.as_pointer()
+        return True
+    except AttributeError:
+        return True
+    except ReferenceError:
+        return False
+    except Exception:
+        return False
+
+def icp_runtime_owner_matches(icp_data) -> bool:
+    owner_scene = _icp_runtime_state.get("owner_scene")
+    if not is_valid_icp_rna(owner_scene) or not is_valid_icp_rna(icp_data):
+        clear_icp_runtime_state()
+        return False
+    try:
+        if owner_scene != icp_data.id_data:
+            return False
+        owner_data = owner_scene.pinsolver_icp
+        if not owner_data.has_preview and not owner_data.is_icp_running:
+            clear_icp_runtime_state()
+            return False
+        return True
+    except ReferenceError:
+        clear_icp_runtime_state()
+        return False
+
+def restore_icp_runtime_preview(context, clear_state: bool = True) -> bool:
+    source = _icp_runtime_state.get("owner_source")
+    original = _icp_runtime_state.get("original_source_matrix")
+    owner_scene = _icp_runtime_state.get("owner_scene")
+    if not is_valid_icp_rna(owner_scene) or not is_valid_icp_rna(source) or original is None:
+        clear_icp_runtime_state()
+        return False
+    try:
+        source.matrix_world = original.copy()
+        if context:
+            context.view_layer.update()
+        owner_data = owner_scene.pinsolver_icp
+        owner_data.has_preview = False
+    except ReferenceError:
+        clear_icp_runtime_state()
+        return False
+    if clear_state:
+        clear_icp_runtime_state()
+    return True
+
+def release_other_icp_preview(context, icp_data) -> bool:
+    owner_scene = _icp_runtime_state.get("owner_scene")
+    if owner_scene is None:
+        return True
+    if not is_valid_icp_rna(owner_scene) or not is_valid_icp_rna(icp_data):
+        clear_icp_runtime_state()
+        return True
+    try:
+        if owner_scene == icp_data.id_data:
+            owner_data = owner_scene.pinsolver_icp
+            if not owner_data.has_preview and not owner_data.is_icp_running:
+                clear_icp_runtime_state()
+            return True
+        owner_data = owner_scene.pinsolver_icp
+        if owner_data.is_icp_running:
+            return False
+    except ReferenceError:
+        clear_icp_runtime_state()
+        return True
+    restore_icp_runtime_preview(context)
+    return True
+
+def set_icp_runtime_owner(context, icp_data, source, target) -> None:
+    clear_icp_runtime_state()
+    _icp_runtime_state["owner_scene"] = getattr(icp_data, "id_data", None) or getattr(context, "scene", None)
+    _icp_runtime_state["owner_source"] = source
+    _icp_runtime_state["owner_target"] = target
+    _icp_runtime_state["input_invalidated"] = False
+
+def reset_icp_for_object_change(icp_data, context) -> None:
+    if getattr(icp_data, "is_icp_running", False):
+        if icp_runtime_owner_matches(icp_data):
+            _icp_runtime_state["input_invalidated"] = True
+            cancel_event = _icp_runtime_state.get("cancel_event")
+            if cancel_event is not None:
+                cancel_event.set()
+        icp_data.alignment_pins.clear()
+        icp_data.alignment_pin_idx = 0
+        clear_icp_pick_state(icp_data)
+        icp_data.show_preview_overlay = False
+        return
+
+    if icp_runtime_owner_matches(icp_data):
+        restore_icp_runtime_preview(context)
+    icp_data.alignment_pins.clear()
+    icp_data.alignment_pin_idx = 0
+    clear_icp_pick_state(icp_data)
+    icp_data.has_preview = False
+    icp_data.show_preview_overlay = False
+    set_icp_status(icp_data, 'NONE', "")
+    if context:
+        redraw_all_3d_views(context)
+
+def object_world_bbox_diagonal(obj) -> float:
+    if not obj:
+        return 1.0
+    try:
+        points = [obj.matrix_world @ Vector(corner) for corner in obj.bound_box]
+        if not points:
+            return 1.0
+        min_v = Vector((min(p.x for p in points), min(p.y for p in points), min(p.z for p in points)))
+        max_v = Vector((max(p.x for p in points), max(p.y for p in points), max(p.z for p in points)))
+        return max(1e-6, (max_v - min_v).length)
+    except Exception:
+        return 1.0
+
+def get_icp_effective_sample_counts(icp_data, source=None, target=None) -> Tuple[int, int]:
+    src_polys = len(source.data.polygons) if source and getattr(source, "data", None) else 500
+    tgt_polys = len(target.data.polygons) if target and getattr(target, "data", None) else 1000
+    auto_source_count = min(8000, max(1500, int(src_polys * 4)))
+    auto_target_count = min(16000, max(3000, int(tgt_polys * 5)))
+    if icp_data.icp_quality_preset == 'FINE':
+        source_count = min(int(icp_data.source_sample_count), int(auto_source_count * 1.45))
+        target_count = min(int(icp_data.target_sample_count), int(auto_target_count * 1.45))
+        return source_count, target_count
+    if icp_data.icp_quality_preset != 'AUTO':
+        return int(icp_data.source_sample_count), int(icp_data.target_sample_count)
+    return auto_source_count, auto_target_count
+
+def get_icp_settings(icp_data, source=None, target=None) -> IcpSettings:
+    max_distance = float(icp_data.max_correspondence_distance) if icp_data.use_max_correspondence_distance else None
+    iterations = int(icp_data.iterations)
+    tolerance = float(icp_data.tolerance)
+    rejection_scale = float(icp_data.rejection_scale)
+    trim_fraction = float(icp_data.trim_fraction)
+    pyramid_levels = int(icp_data.pyramid_levels)
+    refinement_method = str(icp_data.icp_refinement_method)
+    tangent_weight = float(icp_data.icp_tangent_weight)
+    coverage_balance = float(icp_data.icp_coverage_balance)
+    allow_scale = bool(getattr(icp_data, "use_icp_scale_refinement", False))
+    fine_polish_passes = 0
+    fine_polish_strength = 0.0
+    if icp_data.icp_quality_preset == 'AUTO':
+        diag = min(object_world_bbox_diagonal(source), object_world_bbox_diagonal(target))
+        max_distance = max(1e-6, diag * 0.03)
+        iterations = 40
+        tolerance = 0.0001
+        rejection_scale = 2.5
+        trim_fraction = 0.70
+        pyramid_levels = 3
+        refinement_method = 'AUTO'
+        tangent_weight = 0.45
+        coverage_balance = 0.50
+    elif icp_data.icp_quality_preset == 'FINE':
+        fine_polish_passes = 1
+        fine_polish_strength = 0.75
+    return IcpSettings(
+        iterations,
+        tolerance,
+        max_distance,
+        rejection_scale,
+        trim_fraction,
+        pyramid_levels,
+        refinement_method,
+        tangent_weight,
+        coverage_balance,
+        allow_scale,
+        fine_polish_passes,
+        fine_polish_strength,
+        use_fast_nearest=True,
+        reciprocal_correspondence=True,
+        exact_final_nearest=icp_data.icp_quality_preset == 'FINE',
+    )
+
+def constrain_no_pin_icp_settings(settings: IcpSettings, source, target) -> IcpSettings:
+    if settings.max_correspondence_distance is not None and settings.max_correspondence_distance > 0.0:
+        return settings
+    diagonal = min(object_world_bbox_diagonal(source), object_world_bbox_diagonal(target))
+    return replace(settings, max_correspondence_distance=max(1e-6, diagonal * 0.03))
+
+def matrix_world_nearly_equal(a: Matrix, b: Matrix, tolerance: float = 1e-5) -> bool:
+    if a is None or b is None:
+        return False
+    return all(abs(float(a[r][c]) - float(b[r][c])) <= tolerance for r in range(4) for c in range(4))
+
+def validate_icp_objects(icp_data) -> Tuple[bool, str]:
+    source = icp_data.source_object
+    target = icp_data.target_object
+    if not source or not target:
+        return False, "Set Source and Target mesh objects"
+    if source == target:
+        return False, "Source and Target must be different objects"
+    if source.type != 'MESH' or target.type != 'MESH':
+        return False, "Source and Target must be mesh objects"
+    return True, ""
+
+def get_icp_source_mask_options(icp_data) -> Tuple[bool, bool, str]:
+    mask_mode = getattr(icp_data, "source_mask_mode", 'OFF')
+    selected_faces = False
+    selected_vertices = False
+    vertex_group_name = ""
+    if mask_mode == 'SELECTED_FACES':
+        selected_faces = True
+    elif mask_mode == 'SELECTED_VERTICES':
+        selected_vertices = True
+    elif mask_mode == 'VERTEX_GROUP':
+        vertex_group_name = getattr(icp_data, "source_vertex_group_name", "")
+    return selected_faces, selected_vertices, vertex_group_name
+
+def sample_icp_object_points_with_normals(obj, depsgraph, use_evaluated: bool, selected_only: bool, sample_count: int, seed: int, selected_vertices_only: bool = False, vertex_group_name: str = "", cancel_event=None, focus_points: Optional[np.ndarray] = None, focus_fraction: float = 0.0) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
+    triangles, message = extract_world_triangles(obj, depsgraph, use_evaluated, selected_only, selected_vertices_only, vertex_group_name, cancel_event)
+    if triangles is None:
+        return None, None, message
+    points, normals = sample_surface_points_with_normals(triangles, sample_count, seed, cancel_event, focus_points, focus_fraction)
+    if len(points) < 3 or len(normals) < 3:
+        return None, None, "Not enough usable surface samples"
+    return points, normals, ""
+
+def is_raycast_object_match(hit_obj, target_obj) -> bool:
+    if not hit_obj or not target_obj:
+        return False
+    return hit_obj == target_obj or getattr(hit_obj, "original", None) == target_obj or hit_obj.name == target_obj.name
+
+def snap_icp_raycast_location(obj, depsgraph, matrix: Matrix, face_index: int, loc: Vector, snap_to_vertex: bool) -> Vector:
+    if not snap_to_vertex or not obj or obj.type != 'MESH':
+        return loc
+    try:
+        eval_obj = obj.evaluated_get(depsgraph)
+        mesh = eval_obj.data
+        if mesh and hasattr(mesh, "polygons") and 0 <= face_index < len(mesh.polygons):
+            face = mesh.polygons[face_index]
+            closest_v_loc = None
+            min_dist = float('inf')
+            for v_idx in face.vertices:
+                v_world = matrix @ mesh.vertices[v_idx].co
+                dist = (v_world - loc).length
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_v_loc = v_world
+            if closest_v_loc:
+                return closest_v_loc
+    except Exception:
+        pass
+    return loc
+
+def raycast_icp_visible_pin_point(context: bpy.types.Context, source_obj: bpy.types.Object, target_obj: bpy.types.Object, origin: Vector, direction: Vector, snap_to_vertex: bool = False) -> Tuple[bool, Optional[str], Optional[bpy.types.Object], Optional[Vector]]:
+    scene = context.scene
+    depsgraph = context.evaluated_depsgraph_get()
+    cur_origin = origin + direction * PinSolverConfig.RAYCAST_START_OFFSET
+    for _ in range(PinSolverConfig.RAYCAST_MAX_RETRIES * 4):
+        hit, loc, normal, index, obj, matrix = scene.ray_cast(depsgraph, cur_origin, direction)
+        if not hit:
+            return False, None, None, None
+        if is_raycast_object_match(obj, source_obj):
+            return True, 'SOURCE', source_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex)
+        if is_raycast_object_match(obj, target_obj):
+            return True, 'TARGET', target_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex)
+        cur_origin = loc + direction * 0.01
+    return False, None, None, None
+
+def icp_world_to_local(obj: bpy.types.Object, world_point: Vector) -> Tuple[Vector, bool]:
+    if not obj:
+        return Vector(world_point), False
+    try:
+        return obj.matrix_world.inverted() @ Vector(world_point), True
+    except Exception:
+        return Vector(world_point), False
+
+def get_icp_pin_source_world(icp_data, pin) -> Optional[Vector]:
+    if not pin.has_source:
+        return None
+    if icp_data.show_preview_overlay and icp_data.source_object and pin.has_source_local:
+        try:
+            return icp_data.source_object.matrix_world @ Vector(pin.source_pos_local)
+        except Exception:
+            pass
+    return Vector(pin.source_pos_3d)
+
+def get_icp_pin_target_world(icp_data, pin) -> Optional[Vector]:
+    if not pin.has_target:
+        return None
+    if icp_data.show_preview_overlay and icp_data.target_object and pin.has_target_local:
+        try:
+            return icp_data.target_object.matrix_world @ Vector(pin.target_pos_local)
+        except Exception:
+            pass
+    return Vector(pin.target_pos_3d)
+
+def get_icp_alignment_pin_points(icp_data) -> Tuple[np.ndarray, np.ndarray]:
+    source_points = []
+    target_points = []
+    for pin in icp_data.alignment_pins:
+        if not pin.has_source or not pin.has_target:
+            continue
+        source_world = get_icp_pin_source_world(icp_data, pin)
+        target_world = get_icp_pin_target_world(icp_data, pin)
+        if source_world is None or target_world is None:
+            continue
+        source_points.append([source_world.x, source_world.y, source_world.z])
+        target_points.append([target_world.x, target_world.y, target_world.z])
+    return np.asarray(source_points, dtype=np.float64), np.asarray(target_points, dtype=np.float64)
+
+def get_icp_initial_transform(icp_data) -> Tuple[bool, np.ndarray, str, int]:
+    identity = np.identity(4, dtype=np.float64)
+    source_points, target_points = get_icp_alignment_pin_points(icp_data)
+    if len(source_points) == 0:
+        return True, identity, "", 0
+    if len(source_points) < 3:
+        return False, identity, "Pin Initial Alignment requires 3+ valid pairs", len(source_points)
+    if icp_data.use_icp_scale_correction:
+        ok, matrix, message = similarity_transform_from_points(source_points, target_points)
+    else:
+        ok, matrix, message = rigid_transform_from_points(source_points, target_points)
+    return ok, matrix, message, len(source_points)
+
+def icp_pin_alignment_residual(source_points: np.ndarray, target_points: np.ndarray, transform: np.ndarray) -> float:
+    if len(source_points) == 0:
+        return -1.0
+    transformed = (transform[:3, :3] @ source_points.T).T + transform[:3, 3]
+    return float(np.mean(np.linalg.norm(transformed - target_points, axis=1)))
+
+def revert_icp_preview(context, icp_data) -> bool:
+    if not icp_runtime_owner_matches(icp_data):
+        return False
+    return restore_icp_runtime_preview(context)
+
+class PINSOLVER_OT_icp_add_pin(Operator):
+    bl_idname = "view3d.pinsolver_icp_add_pin"
+    bl_label = "Add Alignment Pin"
+    bl_description = "Add a Source/Target correspondence pin for initial model alignment"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def _add_pin(self, context) -> int:
+        icp_data = context.scene.pinsolver_icp
+        idx = len(icp_data.alignment_pins)
+        pin = icp_data.alignment_pins.add()
+        pin.name = f"Align Pin {idx + 1}"
+        pin.color = (*colorsys.hsv_to_rgb((idx * 0.618) % 1.0, 0.85, 1.0), 1.0)
+        if icp_data.source_object:
+            pin.source_pos_3d = icp_data.source_object.matrix_world.translation
+        if icp_data.target_object:
+            pin.target_pos_3d = icp_data.target_object.matrix_world.translation
+        icp_data.alignment_pin_idx = idx
+        icp_data.show_preview_overlay = True
+        set_icp_status(icp_data, 'NONE', "")
+        redraw_all_3d_views(context)
+        return idx
+
+    def execute(self, context):
+        self._add_pin(context)
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        idx = self._add_pin(context)
+        try:
+            bpy.ops.view3d.pinsolver_icp_pick_pin_point('INVOKE_DEFAULT', point_role='SOURCE', target_index=idx, auto_next=True)
+        except Exception:
+            pass
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_remove_pin(Operator):
+    bl_idname = "view3d.pinsolver_icp_remove_pin"
+    bl_label = "Remove Alignment Pin"
+    bl_description = "Remove the active ICP alignment pin"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        idx = icp_data.alignment_pin_idx
+        if 0 <= idx < len(icp_data.alignment_pins):
+            icp_data.alignment_pins.remove(idx)
+            icp_data.alignment_pin_idx = max(0, min(idx, len(icp_data.alignment_pins) - 1))
+            clear_icp_pick_state(icp_data)
+            set_icp_status(icp_data, 'NONE', "")
+            redraw_all_3d_views(context)
+            return {'FINISHED'}
+        return {'CANCELLED'}
+
+class PINSOLVER_OT_icp_clear_pins(Operator):
+    bl_idname = "view3d.pinsolver_icp_clear_pins"
+    bl_label = "Clear Alignment Pins"
+    bl_description = "Remove all ICP alignment pins"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        icp_data.alignment_pins.clear()
+        icp_data.alignment_pin_idx = 0
+        clear_icp_pick_state(icp_data)
+        set_icp_status(icp_data, 'NONE', "")
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_pick_pin_point(Operator):
+    bl_idname = "view3d.pinsolver_icp_pick_pin_point"
+    bl_label = "Pick Alignment Pin Point"
+    bl_description = "Pick the Source or Target mesh point for the active ICP alignment pin"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    point_role: StringProperty(default='SOURCE')
+    target_index: IntProperty(default=-1)
+    auto_next: BoolProperty(default=False)
+
+    def _clear_pick_state(self, context):
+        icp_data = context.scene.pinsolver_icp
+        idx = self.target_index if self.target_index >= 0 else icp_data.alignment_pick_index
+        if icp_data.alignment_pick_index == idx and icp_data.alignment_pick_role == self.point_role:
+            clear_icp_pick_state(icp_data)
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            self._clear_pick_state(context)
+            redraw_all_3d_views(context)
+            return {'CANCELLED'}
+        if event.type not in {'LEFTMOUSE', 'MOUSE_LMB_2X'} or event.value != 'PRESS':
+            return {'PASS_THROUGH'}
+
+        icp_data = context.scene.pinsolver_icp
+        idx = self.target_index if self.target_index >= 0 else icp_data.alignment_pin_idx
+        if idx < 0 or idx >= len(icp_data.alignment_pins):
+            self._clear_pick_state(context)
+            return {'CANCELLED'}
+        target_obj = icp_data.source_object if self.point_role == 'SOURCE' else icp_data.target_object
+        opposite_obj = icp_data.target_object if self.point_role == 'SOURCE' else icp_data.source_object
+        if not target_obj and not opposite_obj:
+            self.report({'WARNING'}, f"Set {'Source' if self.point_role == 'SOURCE' else 'Target'} Object first")
+            self._clear_pick_state(context)
+            return {'CANCELLED'}
+
+        region, rv3d, rx, ry = get_3d_region_context(context, event, cross_window=True)
+        if not region or not rv3d:
+            self._clear_pick_state(context)
+            return {'CANCELLED'}
+        origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
+        direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
+        hit, picked_role, picked_obj, loc = raycast_icp_visible_pin_point(
+            context,
+            icp_data.source_object,
+            icp_data.target_object,
+            origin,
+            direction,
+            snap_to_vertex=event.alt
+        )
+        if not hit:
+            self.report({'WARNING'}, "Raycast missed Source and Target objects")
+            self._clear_pick_state(context)
+            return {'CANCELLED'}
+
+        pin = icp_data.alignment_pins[idx]
+        if picked_role == 'SOURCE':
+            pin.source_pos_3d = loc
+            local, ok = icp_world_to_local(picked_obj, loc)
+            pin.source_pos_local = local
+            pin.has_source_local = ok
+            pin.has_source = True
+        else:
+            pin.target_pos_3d = loc
+            local, ok = icp_world_to_local(picked_obj, loc)
+            pin.target_pos_local = local
+            pin.has_target_local = ok
+            pin.has_target = True
+        icp_data.alignment_pin_idx = idx
+        icp_data.show_preview_overlay = True
+        set_icp_status(icp_data, 'NONE', "")
+        redraw_all_3d_views(context)
+        bpy.ops.ed.undo_push(message="PinSolver: Pick ICP Alignment Pin")
+        self._clear_pick_state(context)
+        if self.auto_next and picked_role == 'SOURCE' and not pin.has_target:
+            try:
+                bpy.ops.view3d.pinsolver_icp_pick_pin_point('INVOKE_DEFAULT', point_role='TARGET', target_index=idx, auto_next=False)
+            except Exception:
+                pass
+        elif self.auto_next and picked_role == 'TARGET' and not pin.has_source:
+            try:
+                bpy.ops.view3d.pinsolver_icp_pick_pin_point('INVOKE_DEFAULT', point_role='SOURCE', target_index=idx, auto_next=False)
+            except Exception:
+                pass
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        icp_data = context.scene.pinsolver_icp
+        idx = self.target_index if self.target_index >= 0 else icp_data.alignment_pin_idx
+        if idx < 0 or idx >= len(icp_data.alignment_pins):
+            self.report({'WARNING'}, "Add an Alignment Pin first")
+            return {'CANCELLED'}
+        icp_data.alignment_pick_role = self.point_role
+        icp_data.alignment_pick_index = idx
+        redraw_all_3d_views(context)
+        context.window_manager.modal_handler_add(self)
+        return {'RUNNING_MODAL'}
+
+class PINSOLVER_OT_icp_preview_pin_alignment(Operator):
+    bl_idname = "view3d.pinsolver_icp_preview_pin_alignment"
+    bl_label = "Preview Pins"
+    bl_description = "Preview alignment from Alignment Pins only, without ICP refinement"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        if icp_data.is_icp_running:
+            self.report({'WARNING'}, "Cancel or wait for ICP to finish first")
+            return {'CANCELLED'}
+        start_time = time.perf_counter()
+        ok, message = validate_icp_objects(icp_data)
+        if not ok:
+            set_icp_status(icp_data, 'ERROR', message, elapsed_seconds=time.perf_counter() - start_time)
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+
+        if not release_other_icp_preview(context, icp_data):
+            self.report({'WARNING'}, "ICP is running in another scene")
+            return {'CANCELLED'}
+        if icp_data.has_preview:
+            revert_icp_preview(context, icp_data)
+
+        source = icp_data.source_object
+        target = icp_data.target_object
+        depsgraph = context.evaluated_depsgraph_get()
+        original_matrix = source.matrix_world.copy()
+        source_points, target_points = get_icp_alignment_pin_points(icp_data)
+        if len(source_points) < 3:
+            message = "Pin Align requires 3+ valid pairs"
+            set_icp_status(icp_data, 'ERROR', message, source_points=len(source_points), target_points=len(target_points), elapsed_seconds=time.perf_counter() - start_time)
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+        ok, transform, message, pin_pair_count = get_icp_initial_transform(icp_data)
+        if not ok:
+            set_icp_status(icp_data, 'ERROR', message, source_points=len(source_points), target_points=len(target_points), elapsed_seconds=time.perf_counter() - start_time)
+            return {'CANCELLED'}
+
+        try:
+            new_matrix = compose_source_world_matrix(original_matrix, transform)
+            source.matrix_world = new_matrix
+            context.view_layer.update()
+            translation, rotation = transform_delta_metrics(transform)
+            residual = icp_pin_alignment_residual(source_points, target_points, transform)
+
+            set_icp_runtime_owner(context, icp_data, source, target)
+            _icp_runtime_state["original_source_matrix"] = original_matrix.copy()
+            _icp_runtime_state["preview_source_matrix"] = new_matrix.copy()
+            _icp_runtime_state["result_transform"] = transform.copy()
+            _icp_runtime_state["source_fingerprint"] = object_fingerprint(source, depsgraph, icp_data.use_evaluated_source)
+            _icp_runtime_state["target_fingerprint"] = object_fingerprint(target, depsgraph, icp_data.use_evaluated_target)
+
+            icp_data.has_preview = True
+            icp_data.show_preview_overlay = True
+            init_label = "Pin Align + Scale" if icp_data.use_icp_scale_correction else "Pin Align"
+            set_icp_status(icp_data, 'PREVIEW', f"{init_label} {pin_pair_count} pairs", residual, translation, rotation, len(source_points), len(target_points), time.perf_counter() - start_time)
+            redraw_all_3d_views(context)
+            return {'FINISHED'}
+        except Exception:
+            traceback.print_exc()
+            source.matrix_world = original_matrix
+            context.view_layer.update()
+            icp_data.has_preview = False
+            clear_icp_runtime_state()
+            set_icp_status(icp_data, 'ERROR', "Pin Align preview failed", elapsed_seconds=time.perf_counter() - start_time)
+            return {'CANCELLED'}
+
+class PINSOLVER_OT_icp_preview(Operator):
+    bl_idname = "view3d.pinsolver_icp_preview"
+    bl_label = "Preview ICP"
+    bl_description = "Preview rigid mesh alignment from Source to Target"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        if icp_data.is_icp_running:
+            self.report({'WARNING'}, "ICP is already running")
+            return {'CANCELLED'}
+        ok, message = validate_icp_objects(icp_data)
+        if not ok:
+            set_icp_status(icp_data, 'ERROR', message)
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+
+        if not release_other_icp_preview(context, icp_data):
+            self.report({'WARNING'}, "ICP is running in another scene")
+            return {'CANCELLED'}
+        if icp_data.has_preview:
+            revert_icp_preview(context, icp_data)
+
+        source = icp_data.source_object
+        target = icp_data.target_object
+        depsgraph = context.evaluated_depsgraph_get()
+        original_matrix = source.matrix_world.copy()
+        start_time = time.perf_counter()
+        context.window_manager.progress_begin(0, 4)
+        try:
+            set_icp_runtime_owner(context, icp_data, source, target)
+            context.window_manager.progress_update(1)
+            ok, initial_transform, message, pin_pair_count = get_icp_initial_transform(icp_data)
+            if not ok:
+                set_icp_status(icp_data, 'ERROR', message, elapsed_seconds=time.perf_counter() - start_time)
+                context.window_manager.progress_end()
+                return {'CANCELLED'}
+            if pin_pair_count > 0:
+                pin_align_matrix = compose_source_world_matrix(original_matrix, initial_transform)
+                source.matrix_world = pin_align_matrix
+                context.view_layer.update()
+                init_label = "Pin Init + Scale" if icp_data.use_icp_scale_correction else "Pin Init"
+                set_icp_status(icp_data, 'RUNNING', f"{init_label} {pin_pair_count} pairs + Preparing ICP...", elapsed_seconds=0.0)
+                redraw_all_3d_views(context)
+            else:
+                set_icp_status(icp_data, 'RUNNING', "Preparing ICP...", elapsed_seconds=0.0)
+                redraw_all_3d_views(context)
+
+            self._source = source
+            self._target = target
+            self._scene = context.scene
+            self._icp_data = icp_data
+            self._original_matrix = original_matrix.copy()
+            self._initial_transform = initial_transform.copy()
+            self._pin_pair_count = pin_pair_count
+            self._source_points_count = 0
+            self._target_points_count = 0
+            self._start_time = start_time
+            self._result = None
+            self._worker_error = None
+            self._worker_started = False
+            self._prepared = False
+            self._defer_ticks = 0
+            self._cancel_event = threading.Event()
+            self._timer = context.window_manager.event_timer_add(0.1, window=context.window)
+            _icp_runtime_state["cancel_event"] = self._cancel_event
+            icp_data.is_icp_running = True
+            context.window_manager.modal_handler_add(self)
+            return {'RUNNING_MODAL'}
+        except Exception:
+            traceback.print_exc()
+            source.matrix_world = original_matrix
+            context.view_layer.update()
+            icp_data.has_preview = False
+            icp_data.is_icp_running = False
+            clear_icp_runtime_state()
+            set_icp_status(icp_data, 'ERROR', "ICP preview failed", elapsed_seconds=time.perf_counter() - start_time)
+            context.window_manager.progress_end()
+            return {'CANCELLED'}
+
+    def _worker_run(self):
+        try:
+            source_points, target_points, target_normals, source_normals = self._worker_args
+            self._result = run_icp(source_points, target_points, self._settings, target_normals, source_normals, self._cancel_event)
+        except Exception as exc:
+            self._worker_error = exc
+
+    def _prepare_and_start_worker(self, context):
+        icp_data = self._icp_data
+        if self._cancel_event.is_set() or _icp_runtime_state.get("input_invalidated", False):
+            self._finish_modal(context)
+            self._restore_original(context)
+            set_icp_status(icp_data, 'CANCELLED', "ICP cancelled", elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+
+        try:
+            depsgraph = context.evaluated_depsgraph_get()
+            source_sample_count, target_sample_count = get_icp_effective_sample_counts(icp_data, self._source, self._target)
+            source_selected_faces, source_selected_vertices, source_vertex_group_name = get_icp_source_mask_options(icp_data)
+            source_use_evaluated = bool(icp_data.use_evaluated_source) and not (source_selected_faces or source_selected_vertices)
+            target_use_evaluated = bool(icp_data.use_evaluated_target) and not bool(icp_data.target_selected_faces_only)
+            pin_source_focus, pin_target_focus = get_icp_alignment_pin_points(icp_data)
+            focus_fraction = 0.20 if len(pin_source_focus) >= 3 else 0.0
+            context.window_manager.progress_update(2)
+            set_icp_status(icp_data, 'RUNNING', "Sampling Source...", elapsed_seconds=time.perf_counter() - self._start_time)
+            source_points, source_normals, message = sample_icp_object_points_with_normals(
+                self._source,
+                depsgraph,
+                source_use_evaluated,
+                source_selected_faces,
+                source_sample_count,
+                icp_data.random_seed,
+                source_selected_vertices,
+                source_vertex_group_name,
+                self._cancel_event,
+                pin_source_focus,
+                focus_fraction
+            )
+            if source_points is None:
+                self._finish_modal(context)
+                self._restore_original(context)
+                set_icp_status(icp_data, 'ERROR', f"Source: {message}", elapsed_seconds=time.perf_counter() - self._start_time)
+                return {'CANCELLED'}
+            if self._cancel_event.is_set():
+                self._finish_modal(context)
+                self._restore_original(context)
+                set_icp_status(icp_data, 'CANCELLED', "ICP cancelled", elapsed_seconds=time.perf_counter() - self._start_time)
+                return {'CANCELLED'}
+
+            context.window_manager.progress_update(3)
+            set_icp_status(icp_data, 'RUNNING', "Sampling Target...", source_points=len(source_points), elapsed_seconds=time.perf_counter() - self._start_time)
+            target_points, target_normals, message = sample_icp_object_points_with_normals(
+                self._target,
+                depsgraph,
+                target_use_evaluated,
+                icp_data.target_selected_faces_only,
+                target_sample_count,
+                icp_data.random_seed + 1,
+                cancel_event=self._cancel_event,
+                focus_points=pin_target_focus,
+                focus_fraction=focus_fraction
+            )
+            if target_points is None:
+                self._finish_modal(context)
+                self._restore_original(context)
+                set_icp_status(icp_data, 'ERROR', f"Target: {message}", source_points=len(source_points), elapsed_seconds=time.perf_counter() - self._start_time)
+                return {'CANCELLED'}
+            if self._cancel_event.is_set():
+                self._finish_modal(context)
+                self._restore_original(context)
+                set_icp_status(icp_data, 'CANCELLED', "ICP cancelled", source_points=len(source_points), target_points=len(target_points), elapsed_seconds=time.perf_counter() - self._start_time)
+                return {'CANCELLED'}
+
+            self._source_points_count = len(source_points)
+            self._target_points_count = len(target_points)
+            self._settings = get_icp_settings(icp_data, self._source, self._target)
+            if self._pin_pair_count == 0:
+                self._settings = constrain_no_pin_icp_settings(
+                    self._settings, self._source, self._target)
+            self._worker_args = (
+                source_points.copy(),
+                target_points.copy(),
+                target_normals.copy() if target_normals is not None else None,
+                source_normals.copy() if source_normals is not None else None,
+            )
+            self._prepared = True
+            set_icp_status(icp_data, 'RUNNING', "Running ICP...", source_points=self._source_points_count, target_points=self._target_points_count, elapsed_seconds=time.perf_counter() - self._start_time)
+            self._start_worker(context)
+            return {'RUNNING_MODAL'}
+        except IcpCancelled:
+            self._finish_modal(context)
+            self._restore_original(context)
+            set_icp_status(icp_data, 'CANCELLED', "ICP cancelled", elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+        except Exception:
+            traceback.print_exc()
+            self._finish_modal(context)
+            self._restore_original(context)
+            set_icp_status(icp_data, 'ERROR', "ICP preview failed", elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+
+    def _start_worker(self, context):
+        self._worker_started = True
+        self._thread = threading.Thread(target=self._worker_run, name="PinSolverICPPreview", daemon=True)
+        self._thread.start()
+        context.window_manager.progress_update(3)
+
+    def _finish_modal(self, context):
+        if getattr(self, "_timer", None) is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+        context.window_manager.progress_end()
+        icp_data = self._icp_data
+        icp_data.is_icp_running = False
+        _icp_runtime_state["cancel_event"] = None
+
+    def _restore_original(self, context):
+        if getattr(self, "_source", None) and getattr(self, "_original_matrix", None):
+            self._source.matrix_world = self._original_matrix
+            context.view_layer.update()
+        self._icp_data.has_preview = False
+        clear_icp_runtime_state()
+        redraw_all_3d_views(context)
+
+    def modal(self, context, event):
+        icp_data = self._icp_data
+        if event.type == 'ESC':
+            if getattr(self, "_cancel_event", None):
+                self._cancel_event.set()
+                set_icp_status(icp_data, 'RUNNING', "Cancelling ICP...", source_points=getattr(self, "_source_points_count", 0), target_points=getattr(self, "_target_points_count", 0), elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'RUNNING_MODAL'}
+
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        if not self._prepared:
+            if self._cancel_event.is_set():
+                self._finish_modal(context)
+                self._restore_original(context)
+                set_icp_status(icp_data, 'CANCELLED', "ICP cancelled", elapsed_seconds=time.perf_counter() - self._start_time)
+                return {'CANCELLED'}
+            self._defer_ticks += 1
+            set_icp_status(icp_data, 'RUNNING', "Preparing ICP...", elapsed_seconds=time.perf_counter() - self._start_time)
+            redraw_all_3d_views(context)
+            if self._defer_ticks < 3:
+                return {'RUNNING_MODAL'}
+            return self._prepare_and_start_worker(context)
+
+        if not self._worker_started:
+            self._start_worker(context)
+            return {'RUNNING_MODAL'}
+
+        if self._thread.is_alive():
+            set_icp_status(icp_data, 'RUNNING', "Running ICP...", source_points=self._source_points_count, target_points=self._target_points_count, elapsed_seconds=time.perf_counter() - self._start_time)
+            redraw_all_3d_views(context)
+            return {'RUNNING_MODAL'}
+
+        self._finish_modal(context)
+
+        if self._worker_error is not None:
+            traceback.print_exception(type(self._worker_error), self._worker_error, self._worker_error.__traceback__)
+            self._restore_original(context)
+            set_icp_status(icp_data, 'ERROR', "ICP preview failed", elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+
+        result = self._result
+        if result is None:
+            self._restore_original(context)
+            set_icp_status(icp_data, 'ERROR', "ICP preview failed", elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+
+        if not result.success:
+            self._restore_original(context)
+            status = 'CANCELLED' if result.message == "ICP cancelled" else 'ERROR'
+            set_icp_status(icp_data, status, result.message, result.residual, source_points=self._source_points_count, target_points=self._target_points_count, elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+
+        depsgraph = context.evaluated_depsgraph_get()
+        total_transform = result.transform @ self._initial_transform
+        new_matrix = compose_source_world_matrix(self._original_matrix, total_transform)
+        self._source.matrix_world = new_matrix
+        context.view_layer.update()
+        translation, rotation = transform_delta_metrics(total_transform)
+
+        use_evaluated_source = bool(icp_data.use_evaluated_source)
+        use_evaluated_target = bool(icp_data.use_evaluated_target)
+        _icp_runtime_state["original_source_matrix"] = self._original_matrix.copy()
+        _icp_runtime_state["preview_source_matrix"] = new_matrix.copy()
+        _icp_runtime_state["result_transform"] = total_transform.copy()
+        _icp_runtime_state["source_fingerprint"] = object_fingerprint(self._source, depsgraph, use_evaluated_source)
+        _icp_runtime_state["target_fingerprint"] = object_fingerprint(self._target, depsgraph, use_evaluated_target)
+
+        icp_data.has_preview = True
+        if self._pin_pair_count > 0:
+            init_label = "Pin Init + Scale" if icp_data.use_icp_scale_correction else "Pin Init"
+            result_message = f"{init_label} {self._pin_pair_count} pairs + {result.message}"
+        else:
+            result_message = result.message
+        result_status = 'WARNING' if result.confidence < 0.35 else 'PREVIEW'
+        if result_status == 'WARNING':
+            result_message = f"Low confidence | {result_message}"
+        set_icp_status(
+            icp_data,
+            result_status,
+            result_message,
+            result.residual,
+            translation,
+            rotation,
+            self._source_points_count,
+            self._target_points_count,
+            time.perf_counter() - self._start_time,
+            result.confidence,
+            result.overlap_ratio,
+            result.p95_residual,
+            result.coverage_ratio,
+        )
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_cancel(Operator):
+    bl_idname = "view3d.pinsolver_icp_cancel"
+    bl_label = "Cancel ICP"
+    bl_description = "Cancel the running ICP preview"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        cancel_event = _icp_runtime_state.get("cancel_event")
+        if cancel_event is None or not icp_data.is_icp_running:
+            self.report({'INFO'}, "No ICP preview is running")
+            return {'CANCELLED'}
+        cancel_event.set()
+        set_icp_status(icp_data, 'RUNNING', "Cancelling ICP...", source_points=icp_data.result_source_points, target_points=icp_data.result_target_points, elapsed_seconds=icp_data.result_elapsed_seconds)
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_apply(Operator):
+    bl_idname = "view3d.pinsolver_icp_apply"
+    bl_label = "Apply ICP"
+    bl_description = "Apply the current ICP preview"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        if icp_data.is_icp_running:
+            self.report({'WARNING'}, "Cancel or wait for ICP to finish first")
+            return {'CANCELLED'}
+        source = icp_data.source_object
+        target = icp_data.target_object
+        if not icp_data.has_preview or not source or not target:
+            set_icp_status(icp_data, 'ERROR', "No ICP preview to apply")
+            return {'CANCELLED'}
+        preview_matrix = _icp_runtime_state.get("preview_source_matrix")
+        if not icp_runtime_owner_matches(icp_data) or preview_matrix is None:
+            set_icp_status(icp_data, 'ERROR', "Preview state is missing")
+            return {'CANCELLED'}
+        if not matrix_world_nearly_equal(source.matrix_world, preview_matrix):
+            set_icp_status(icp_data, 'ERROR', "Source changed after Preview. Run Preview again")
+            return {'CANCELLED'}
+        if 0.0 <= icp_data.result_confidence < 0.12:
+            set_icp_status(icp_data, 'ERROR', "ICP confidence is too low. Adjust Pins or Source Mask and Preview again")
+            return {'CANCELLED'}
+        context.view_layer.update()
+        depsgraph = context.evaluated_depsgraph_get()
+        source_fp = object_fingerprint(source, depsgraph, icp_data.use_evaluated_source)
+        if source_fp != _icp_runtime_state.get("source_fingerprint"):
+            set_icp_status(icp_data, 'ERROR', "Source changed after Preview. Run Preview again")
+            return {'CANCELLED'}
+        target_fp = object_fingerprint(target, depsgraph, icp_data.use_evaluated_target)
+        if target_fp != _icp_runtime_state.get("target_fingerprint"):
+            set_icp_status(icp_data, 'ERROR', "Target changed after Preview. Run Preview again")
+            return {'CANCELLED'}
+        icp_data.has_preview = False
+        icp_data.show_preview_overlay = False
+        icp_data.alignment_pins.clear()
+        icp_data.alignment_pin_idx = 0
+        clear_icp_pick_state(icp_data)
+        clear_icp_runtime_state()
+        set_icp_status(icp_data, 'NONE', "")
+        bpy.ops.ed.undo_push(message="PinSolver: Apply ICP Alignment")
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_revert(Operator):
+    bl_idname = "view3d.pinsolver_icp_revert"
+    bl_label = "Revert ICP"
+    bl_description = "Revert the current ICP preview"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        if icp_data.is_icp_running:
+            self.report({'WARNING'}, "Cancel or wait for ICP to finish first")
+            return {'CANCELLED'}
+        if not revert_icp_preview(context, icp_data):
+            set_icp_status(icp_data, 'ERROR', "No ICP preview to revert")
+            return {'CANCELLED'}
+        set_icp_status(icp_data, 'REVERTED', "Reverted")
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_swap_objects(Operator):
+    bl_idname = "view3d.pinsolver_icp_swap_objects"
+    bl_label = "Swap ICP Objects"
+    bl_description = "Swap Source and Target objects"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        global _icp_object_change_guard
+        icp_data = context.scene.pinsolver_icp
+        if icp_data.is_icp_running:
+            self.report({'WARNING'}, "Cancel or wait for ICP to finish first")
+            return {'CANCELLED'}
+        if icp_data.has_preview:
+            revert_icp_preview(context, icp_data)
+        source_object = icp_data.source_object
+        target_object = icp_data.target_object
+        _icp_object_change_guard = True
+        try:
+            icp_data.source_object = target_object
+            icp_data.target_object = source_object
+        finally:
+            _icp_object_change_guard = False
+
+        for pin in icp_data.alignment_pins:
+            pin.source_pos_3d, pin.target_pos_3d = pin.target_pos_3d[:], pin.source_pos_3d[:]
+            pin.source_pos_local, pin.target_pos_local = pin.target_pos_local[:], pin.source_pos_local[:]
+            pin.has_source, pin.has_target = pin.has_target, pin.has_source
+            pin.has_source_local, pin.has_target_local = pin.has_target_local, pin.has_source_local
+        clear_icp_pick_state(icp_data)
+        set_icp_status(icp_data, 'NONE', "")
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
+class PINSOLVER_OT_icp_set_objects_from_selection(Operator):
+    bl_idname = "view3d.pinsolver_icp_set_objects_from_selection"
+    bl_label = "Set ICP Objects from Selection"
+    bl_description = "Set Source from the selected mesh and Target from the active mesh"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        icp_data = context.scene.pinsolver_icp
+        if icp_data.is_icp_running:
+            self.report({'WARNING'}, "Cancel or wait for ICP to finish first")
+            return {'CANCELLED'}
+
+        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        if len(selected_meshes) != 2:
+            self.report({'WARNING'}, "Select exactly two mesh objects")
+            return {'CANCELLED'}
+
+        active_object = context.active_object
+        if active_object in selected_meshes:
+            target = active_object
+            source = next(obj for obj in selected_meshes if obj != target)
+        else:
+            source, target = selected_meshes
+
+        if icp_data.has_preview:
+            revert_icp_preview(context, icp_data)
+        icp_data.source_object = source
+        icp_data.target_object = target
+        set_icp_status(icp_data, 'NONE', "")
+        redraw_all_3d_views(context)
         return {'FINISHED'}
 
 # ==========================================
@@ -3417,6 +5621,87 @@ def draw_line(x1, y1, x2, y2, color, line_width=1.0):
     gpu.state.blend_set('ALPHA'); shader.bind(); shader.uniform_float("color", color); batch.draw(shader); gpu.state.blend_set('NONE')
     try: gpu.state.line_width_set(1.0)
     except: pass
+
+def draw_callback_icp_overlay():
+    context = bpy.context
+    if not getattr(context, "space_data", None) or context.space_data.type != 'VIEW_3D': return
+    icp_data = getattr(context.scene, "pinsolver_icp", None)
+    if not icp_data or not icp_data.show_preview_overlay: return
+    has_alignment_pins = any(p.has_source or p.has_target for p in icp_data.alignment_pins)
+    if not has_alignment_pins: return
+    
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    gpu.state.blend_set('ALPHA')
+
+    def color_with_opacity(color, opacity=1.0):
+        result = list(color)
+        result[3] *= opacity
+        return tuple(result)
+
+    def draw_point_batch(points, color, size):
+        if not points:
+            return
+        try: gpu.state.point_size_set(size)
+        except Exception: pass
+        batch = batch_for_shader(shader, 'POINTS', {"pos": points})
+        shader.bind(); shader.uniform_float("color", color); batch.draw(shader)
+
+    def draw_line_batch(points, color, width):
+        if not points:
+            return
+        try: gpu.state.line_width_set(width)
+        except Exception: pass
+        batch = batch_for_shader(shader, 'LINES', {"pos": points})
+        shader.bind(); shader.uniform_float("color", color); batch.draw(shader)
+    
+    pin_source = []
+    pin_target = []
+    pin_lines = []
+    active_pin_source = []
+    active_pin_target = []
+    active_pin_lines = []
+    active_idx = icp_data.alignment_pin_idx
+    for idx, pin in enumerate(icp_data.alignment_pins):
+        src_vec = get_icp_pin_source_world(icp_data, pin)
+        tgt_vec = get_icp_pin_target_world(icp_data, pin)
+        src = tuple(float(v) for v in src_vec) if src_vec is not None else None
+        tgt = tuple(float(v) for v in tgt_vec) if tgt_vec is not None else None
+        is_active = idx == active_idx
+        pin_color = color_with_opacity(pin.color, 1.0)
+        if src:
+            if is_active:
+                active_pin_source.append(src)
+            else:
+                pin_source.append((src, pin_color))
+        if tgt:
+            if is_active:
+                active_pin_target.append(tgt)
+            else:
+                pin_target.append((tgt, pin_color))
+        if src and tgt:
+            if is_active:
+                active_pin_lines.extend([src, tgt])
+            else:
+                pin_lines.append((src, tgt, color_with_opacity(pin.color, icp_data.icp_line_opacity)))
+
+    for src, tgt, line_color in pin_lines:
+        draw_line_batch([src, tgt], line_color, float(icp_data.icp_line_width))
+    for point, point_color in pin_target:
+        draw_point_batch([point], point_color, float(icp_data.icp_pin_radius))
+    for point, point_color in pin_source:
+        draw_point_batch([point], point_color, float(icp_data.icp_pin_radius))
+    active_pin = icp_data.alignment_pins[active_idx] if 0 <= active_idx < len(icp_data.alignment_pins) else None
+    active_color = color_with_opacity(active_pin.color, 1.0) if active_pin else (1.0, 1.0, 1.0, 1.0)
+    active_line_color = color_with_opacity(active_pin.color, icp_data.icp_line_opacity) if active_pin else active_color
+    draw_line_batch(active_pin_lines, active_line_color, float(icp_data.icp_line_width) + 1.0)
+    draw_point_batch(active_pin_target, active_color, float(icp_data.icp_active_pin_radius))
+    draw_point_batch(active_pin_source, active_color, float(icp_data.icp_active_pin_radius))
+        
+    gpu.state.blend_set('NONE')
+    try: gpu.state.point_size_set(1.0)
+    except Exception: pass
+    try: gpu.state.line_width_set(1.0)
+    except Exception: pass
 
 def draw_callback_overlay():
     context = bpy.context
@@ -3579,6 +5864,30 @@ def draw_callback_overlay():
 class PINSOLVER_UL_targets(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         layout.prop(item, "obj", text="")
+
+class PINSOLVER_UL_icp_pins(UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        split_main = layout.split(factor=0.82, align=True)
+        r_left = split_main.split(factor=0.13, align=True)
+        r_left.operator_context = 'INVOKE_DEFAULT'
+        icp_data = context.scene.pinsolver_icp
+        status_icon = 'CHECKMARK' if item.has_source and item.has_target else 'ERROR'
+        r_left.prop(item, "color", text="")
+        r_name = r_left.row(align=True)
+        r_name.label(text="", icon=status_icon)
+        r_name.prop(item, "name", text="", emboss=False)
+        pick_row = split_main.row(align=True)
+        pick_row.operator_context = 'INVOKE_DEFAULT'
+        is_source_pick = icp_data.alignment_pick_role == 'SOURCE' and icp_data.alignment_pick_index == index
+        is_target_pick = icp_data.alignment_pick_role == 'TARGET' and icp_data.alignment_pick_index == index
+        op = pick_row.operator("view3d.pinsolver_icp_pick_pin_point", text="", icon='OBJECT_ORIGIN', depress=is_source_pick)
+        op.point_role = 'SOURCE'
+        op.target_index = index
+        op.auto_next = True
+        op = pick_row.operator("view3d.pinsolver_icp_pick_pin_point", text="", icon='RESTRICT_SELECT_OFF', depress=is_target_pick)
+        op.point_role = 'TARGET'
+        op.target_index = index
+        op.auto_next = not item.has_source
 
 class PINSOLVER_UL_pins(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -4057,6 +6366,149 @@ class PINSOLVER_PT_panel(Panel):
             col.separator()
             col.prop(settings, "add_pin_offset")
 
+class PINSOLVER_PT_icp_panel(Panel):
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = 'PinSolver'
+    bl_label = "Pin Align"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        icp_data = context.scene.pinsolver_icp
+        controls_enabled = not icp_data.is_icp_running
+        
+        object_row = layout.row(align=True)
+        object_row.enabled = controls_enabled
+        object_column = object_row.column(align=True)
+        object_column.prop(icp_data, "source_object", text="Source")
+        object_column.prop(icp_data, "target_object", text="Target")
+        object_actions = object_row.column(align=True)
+        object_actions.operator("view3d.pinsolver_icp_set_objects_from_selection", text="", icon='RESTRICT_SELECT_OFF')
+        object_actions.operator("view3d.pinsolver_icp_swap_objects", text="", icon='ARROW_LEFTRIGHT')
+        
+        layout.separator()
+        pins_box = layout.column(align=True)
+        pins_box.enabled = controls_enabled
+        row = pins_box.row(align=True)
+        row.label(text="Alignment Pins")
+        row.prop(icp_data, "show_preview_overlay", text="", toggle=True, icon='RESTRICT_VIEW_OFF' if icp_data.show_preview_overlay else 'RESTRICT_VIEW_ON')
+        row = pins_box.row()
+        row.template_list("PINSOLVER_UL_icp_pins", "", icp_data, "alignment_pins", icp_data, "alignment_pin_idx", rows=3)
+        buttons = row.column(align=True)
+        buttons.operator_context = 'INVOKE_DEFAULT'
+        buttons.operator("view3d.pinsolver_icp_add_pin", icon='ADD', text="")
+        buttons.operator("view3d.pinsolver_icp_remove_pin", icon='REMOVE', text="")
+        buttons.operator("view3d.pinsolver_icp_clear_pins", icon='TRASH', text="")
+        if icp_data.alignment_pick_role != 'NONE':
+            pins_box.label(text=f"Picking {icp_data.alignment_pick_role.title()} point", icon='EYEDROPPER')
+        if icp_data.alignment_pins and 0 <= icp_data.alignment_pin_idx < len(icp_data.alignment_pins):
+            pin = icp_data.alignment_pins[icp_data.alignment_pin_idx]
+            pin_col = pins_box.column(align=True)
+            coord_row = pin_col.row(align=True)
+            coord_row.prop(icp_data, "show_icp_pin_coordinates", text="Pin Coordinates", icon='TRIA_DOWN' if icp_data.show_icp_pin_coordinates else 'TRIA_RIGHT', emboss=False)
+            if icp_data.show_icp_pin_coordinates:
+                pin_col.prop(pin, "source_pos_3d")
+                pin_col.prop(pin, "target_pos_3d")
+        valid_pairs = len(get_icp_alignment_pin_points(icp_data)[0])
+        if valid_pairs > 0:
+            pins_box.label(text=f"Initial Alignment Pins: {valid_pairs} / 3+", icon='INFO' if valid_pairs >= 3 else 'ERROR')
+        
+        layout.separator()
+        quality = layout.column(align=True)
+        quality.enabled = controls_enabled
+        quality.prop(icp_data, "icp_quality_preset")
+        scale_row = quality.row(align=True)
+        scale_row.prop(icp_data, "use_icp_scale_correction")
+        scale_row.prop(icp_data, "use_icp_scale_refinement")
+        mask_row = quality.row(align=True)
+        split = mask_row.split(factor=0.42, align=True)
+        split.label(text="Source Mask")
+        split.prop(icp_data, "source_mask_mode", text="")
+        if icp_data.source_mask_mode == 'VERTEX_GROUP':
+            if icp_data.source_object:
+                quality.prop_search(icp_data, "source_vertex_group_name", icp_data.source_object, "vertex_groups", text="Source Group")
+            else:
+                quality.prop(icp_data, "source_vertex_group_name", text="Source Group")
+        elif icp_data.source_mask_mode in {'SELECTED_FACES', 'SELECTED_VERTICES'} and icp_data.use_evaluated_source:
+            quality.label(text="Selection mask uses base Source mesh", icon='INFO')
+        
+        layout.separator()
+        actions = layout.column(align=True)
+        actions.scale_y = 1.2
+        if icp_data.is_icp_running:
+            actions.operator("view3d.pinsolver_icp_cancel", text="Cancel ICP", icon='CANCEL')
+        else:
+            actions.operator("view3d.pinsolver_icp_preview_pin_alignment", text="Preview Pins", icon='EMPTY_AXIS')
+            actions.operator("view3d.pinsolver_icp_preview", text="Preview ICP", icon='PLAY')
+        row = actions.row(align=True)
+        row.enabled = icp_data.has_preview and not icp_data.is_icp_running
+        row.operator("view3d.pinsolver_icp_apply", text="Apply", icon='CHECKMARK')
+        row.operator("view3d.pinsolver_icp_revert", text="Revert", icon='LOOP_BACK')
+        
+        layout.separator()
+        adv_row = layout.row(align=True)
+        adv_row.enabled = controls_enabled
+        adv_row.prop(icp_data, "show_icp_advanced", text="Advanced", icon='TRIA_DOWN' if icp_data.show_icp_advanced else 'TRIA_RIGHT', emboss=False)
+        if icp_data.show_icp_advanced:
+            adv = layout.column(align=True)
+            adv.enabled = controls_enabled
+            adv.label(text="Geometry")
+            row = adv.row(align=True)
+            row.prop(icp_data, "use_evaluated_source", text="Source Eval")
+            row.prop(icp_data, "use_evaluated_target", text="Target Eval")
+            row = adv.row(align=True)
+            row.prop(icp_data, "target_selected_faces_only", text="Target Selected")
+            if icp_data.target_selected_faces_only and icp_data.use_evaluated_target:
+                adv.label(text="Target selection uses base mesh", icon='INFO')
+            sample_col = adv.column(align=True)
+            sample_col.enabled = icp_data.icp_quality_preset == 'CUSTOM'
+            sample_col.prop(icp_data, "source_sample_count")
+            sample_col.prop(icp_data, "target_sample_count")
+            adv.prop(icp_data, "random_seed")
+            adv.separator()
+            adv.label(text="ICP Settings")
+            solver_col = adv.column(align=True)
+            solver_col.enabled = icp_data.icp_quality_preset == 'CUSTOM'
+            solver_col.prop(icp_data, "icp_refinement_method")
+            surface_row = solver_col.row(align=True)
+            surface_row.enabled = icp_data.icp_refinement_method != 'POINT_TO_POINT'
+            surface_row.prop(icp_data, "icp_tangent_weight")
+            solver_col.prop(icp_data, "iterations")
+            solver_col.prop(icp_data, "tolerance")
+            solver_col.prop(icp_data, "rejection_scale")
+            solver_col.prop(icp_data, "trim_fraction")
+            solver_col.prop(icp_data, "icp_coverage_balance")
+            solver_col.prop(icp_data, "pyramid_levels")
+            row = solver_col.row(align=True)
+            row.prop(icp_data, "use_max_correspondence_distance", text="")
+            sub = row.row(align=True)
+            sub.enabled = icp_data.use_max_correspondence_distance and icp_data.icp_quality_preset != 'AUTO'
+            sub.prop(icp_data, "max_correspondence_distance", text="Max Distance")
+            adv.separator()
+            adv.label(text="Display")
+            adv.prop(icp_data, "icp_pin_radius")
+            adv.prop(icp_data, "icp_active_pin_radius")
+            adv.prop(icp_data, "icp_line_width")
+            adv.prop(icp_data, "icp_line_opacity")
+        
+        if icp_data.result_status != 'NONE':
+            layout.separator()
+            box = layout.box()
+            icon = 'ERROR' if icp_data.result_status in {'ERROR', 'WARNING'} else 'TIME' if icp_data.result_status == 'RUNNING' else 'INFO'
+            box.label(text=f"Status: {icp_data.result_status}", icon=icon)
+            if icp_data.result_message:
+                box.label(text=icp_data.result_message)
+            if icp_data.result_residual >= 0.0:
+                box.label(text=f"Residual: {icp_data.result_residual:.6f}")
+                box.label(text=f"Delta: {icp_data.result_translation:.5f} m / {icp_data.result_rotation_degrees:.3f} deg")
+                box.label(text=f"Points: {icp_data.result_source_points} / {icp_data.result_target_points}")
+            if icp_data.result_confidence >= 0.0:
+                box.label(text=f"Confidence: {icp_data.result_confidence:.0%} | Overlap: {icp_data.result_overlap_ratio:.0%}")
+                box.label(text=f"P95: {icp_data.result_p95_residual:.6f} | Coverage: {icp_data.result_coverage_ratio:.0%}")
+            if icp_data.result_elapsed_seconds >= 0.0:
+                box.label(text=f"Time: {icp_data.result_elapsed_seconds:.2f} s")
+
 # ==========================================
 # 6. Registration & State Management
 # ==========================================
@@ -4066,27 +6518,36 @@ class PinSolverAddon:
         for c in classes: bpy.utils.register_class(c)
         bpy.types.Object.pinsolver_data = bpy.props.PointerProperty(type=PinSolverData)
         bpy.types.Scene.pinsolver_settings = bpy.props.PointerProperty(type=PinSolverSettings)
+        bpy.types.Scene.pinsolver_icp = bpy.props.PointerProperty(type=PinSolverICPSettings)
 
     @classmethod
     def unregister(cls):
-        global _draw_handle
+        global _draw_handle, _icp_draw_handle
         if _draw_handle is not None:
             bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
             _draw_handle = None
+        if _icp_draw_handle is not None:
+            bpy.types.SpaceView3D.draw_handler_remove(_icp_draw_handle, 'WINDOW')
+            _icp_draw_handle = None
             
         for c in reversed(classes): bpy.utils.unregister_class(c)
         del bpy.types.Object.pinsolver_data
         del bpy.types.Scene.pinsolver_settings
+        del bpy.types.Scene.pinsolver_icp
 
 classes = (
-    PinSolverSettings, PinSolverPin, PinSolverTargetItem, PinSolverData, 
+    PinSolverSettings, PinSolverPin, PinSolverTargetItem, PinSolverData, PinSolverICPPin, PinSolverICPSettings,
     PINSOLVER_OT_toggle_show_pins, PINSOLVER_OT_set_solve_target, PINSOLVER_OT_toggle_pin_mode,
-    PINSOLVER_UL_targets, PINSOLVER_UL_pins, PINSOLVER_UL_mm_pins, PINSOLVER_OT_add_target, PINSOLVER_OT_remove_target,
+    PINSOLVER_UL_targets, PINSOLVER_UL_icp_pins, PINSOLVER_UL_pins, PINSOLVER_UL_mm_pins, PINSOLVER_OT_add_target, PINSOLVER_OT_remove_target,
     PINSOLVER_OT_pick_2d, PINSOLVER_OT_pick_3d, PINSOLVER_OT_auto_raycast_single, PINSOLVER_OT_sync_clip, PINSOLVER_OT_clear_pins,
     PINSOLVER_OT_add_pin, PINSOLVER_OT_remove_pin, PINSOLVER_OT_solve, 
     PINSOLVER_OT_edit_pins, PINSOLVER_OT_tweak, PINSOLVER_PT_panel,
     PINSOLVER_OT_send_to_layout, PINSOLVER_OT_sync_trackers, PINSOLVER_OT_auto_raycast, PINSOLVER_OT_set_reference_frame,
-    PINSOLVER_OT_bake_animation
+    PINSOLVER_OT_bake_animation,
+    PINSOLVER_OT_icp_add_pin, PINSOLVER_OT_icp_remove_pin, PINSOLVER_OT_icp_clear_pins, PINSOLVER_OT_icp_pick_pin_point,
+    PINSOLVER_OT_icp_preview_pin_alignment,
+    PINSOLVER_OT_icp_preview, PINSOLVER_OT_icp_cancel, PINSOLVER_OT_icp_apply, PINSOLVER_OT_icp_revert, PINSOLVER_OT_icp_swap_objects, PINSOLVER_OT_icp_set_objects_from_selection,
+    PINSOLVER_PT_icp_panel
 )
 
 def register(): PinSolverAddon.register()
