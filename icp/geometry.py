@@ -196,6 +196,14 @@ def _mesh_geometry_signature(mesh) -> Tuple:
 
 def object_fingerprint(obj, depsgraph, use_evaluated_mesh: bool) -> Tuple:
     eval_obj = obj.evaluated_get(depsgraph) if use_evaluated_mesh else obj
+    from ..pointcloud import point_coordinates
+    points = point_coordinates(eval_obj)
+    point_signature = ()
+    if len(points):
+        import hashlib
+        point_signature = (len(points), hashlib.blake2b(points.tobytes(), digest_size=16).hexdigest())
+    if obj.type == 'POINTCLOUD':
+        return (obj.name_full, point_signature, tuple(np.asarray(eval_obj.matrix_world).ravel()))
     mesh = None
     try:
         mesh = eval_obj.to_mesh() if use_evaluated_mesh else obj.data
@@ -212,4 +220,4 @@ def object_fingerprint(obj, depsgraph, use_evaluated_mesh: bool) -> Tuple:
     data_name = obj.data.name_full if getattr(obj, "data", None) else ""
     scene_eval = getattr(depsgraph, "scene_eval", None)
     frame_current = int(getattr(scene_eval, "frame_current", -1))
-    return (obj.name_full, data_name, vertex_count, poly_count, geometry_signature, matrix_values, modifiers, frame_current)
+    return (obj.name_full, data_name, vertex_count, poly_count, geometry_signature, point_signature, matrix_values, modifiers, frame_current)

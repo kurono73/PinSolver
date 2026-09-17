@@ -17,6 +17,8 @@ import time
 import threading
 from dataclasses import replace
 from typing import Tuple, Optional, Any, List, Dict, Set
+from . import pointcloud
+from . import depth_pick
 
 from .icp.geometry import extract_world_triangles, object_fingerprint, sample_surface_points_with_normals
 from .icp.cancel import IcpCancelled
@@ -332,31 +334,25 @@ def get_current_pin_pos_2d(context: bpy.types.Context, cam_data: Any, pin: Any) 
         if clip:
             try:
                 idx = int(cam_data.tracking_object_idx)
+
                 if idx < len(clip.tracking.objects):
                     tracks = clip.tracking.objects[idx].tracks
                     track = tracks.get(pin.track_name)
+
                     if track:
                         scn_f = context.scene.frame_current
-                        c_f = scn_f - clip.frame_start + clip.frame_offset + 1
-                        
-                        frames_to_check = [c_f, c_f - 1, scn_f, scn_f + clip.frame_offset]
-                        marker = None
-                        for f in frames_to_check:
-                            m = track.markers.find_frame(f)
-                            if m: 
-                                marker = m
-                                break
-                                
-                        if not marker:
-                            for m in track.markers:
-                                if m.frame in frames_to_check:
-                                    marker = m
-                                    break
-                                    
+                        c_f = scn_f - clip.frame_start + 1
+
+                        marker = track.markers.find_frame(c_f)
+
                         if marker and not getattr(marker, 'mute', False):
                             return get_track_marker_co(track, marker)
-            except: pass
-        return None 
+
+            except Exception:
+                pass
+
+        return None
+
     return Vector(pin.pos_2d)
 
 def get_closest_pin_item(context: bpy.types.Context, cam_data: Any, target_data: Any, mouse_pos_vec: Vector, region=None, rv3d=None, prefer_type: str = 'NONE') -> Tuple[int, str]:
@@ -559,18 +555,30 @@ def schedule_error_update():
         return None
     bpy.app.timers.register(delayed_update, first_interval=0.05)
 
-def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector, snap_to_vertex: bool = False) -> Tuple[bool, Optional[Vector]]:
+def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector, snap_to_vertex: bool = False, include_points=True, depth_view=None, depth_point=None) -> Tuple[bool, Optional[Vector]]:
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
+    if direction.length_squared < 1e-20:
+        return False, None
+    direction = direction.normalized()
+    if include_points and depth_view is not None and pointcloud.has_points(context):
+        depth_point = depth_pick.pick_view(context, *depth_view,
+            context.scene.pinsolver_settings.pointcloud_circle_radius, snap_to_vertex, True)
     cur_origin = origin + direction * PinSolverConfig.RAYCAST_START_OFFSET 
+    ray_origin = cur_origin.copy()
     
     for _ in range(PinSolverConfig.RAYCAST_MAX_RETRIES):
         hit, loc, normal, index, obj, matrix = scene.ray_cast(depsgraph, cur_origin, direction)
-        if not hit: return False, None
+        if not hit:
+            return (True, depth_point) if depth_point is not None else (False, None)
         if obj and obj.type in {'CAMERA', 'LIGHT', 'SPEAKER'}:
             cur_origin = loc + direction * 0.01
             continue
             
+        if depth_point is not None:
+            distance = (depth_point-ray_origin).dot(direction)
+            if distance < (loc-ray_origin).dot(direction)-max(1e-5, abs(distance)*.0001):
+                return True, depth_point
         if snap_to_vertex and obj and obj.type == 'MESH':
             try:
                 eval_obj = obj.evaluated_get(depsgraph)
@@ -621,7 +629,35 @@ def raycast_pin_from_current_camera(context: bpy.types.Context, cam_data: Any, p
     R_world2bcam = cam_pose.to_3x3().transposed()
     R_world2cv = R_bcam2cv @ R_world2bcam
     direction = (R_world2cv.transposed() @ ray_cv).normalized()
-    return safe_ray_cast(context, cam_pose.translation, direction)
+    point = None
+    if pointcloud.has_points(context):
+        scale = min(1.0, 2048/max(res_x, res_y))
+        size = (max(1, round(res_x*scale)), max(1, round(res_y*scale)))
+        near = max(.001, camera_obj.data.clip_start)
+        far = max(camera_obj.data.clip_end, near+1)
+        projection = Matrix(((2*camintr[0,0]/res_x,0,1-2*camintr[0,2]/res_x,0),
+            (0,2*camintr[1,1]/res_y,2*camintr[1,2]/res_y-1,0),
+            (0,0,-(far+near)/(far-near),-2*far*near/(far-near)),(0,0,-1,0)))
+        mouse = ((x*camintr[0,0]+camintr[0,2])*size[0]/res_x,
+            (res_y-y*camintr[1,1]-camintr[1,2])*size[1]/res_y)
+        radius = min(size)*context.scene.pinsolver_settings.track_pick_radius/100.0
+        pixel_filter = None
+        if HAS_OPENCV and np.linalg.norm(distcoef) > 1e-8:
+            image_radius = min(res_x,res_y)*context.scene.pinsolver_settings.track_pick_radius/100.0
+            angles = np.linspace(0, 2*np.pi, 65)[:-1]
+            boundary = np.column_stack((px+image_radius*np.cos(angles), py+image_radius*np.sin(angles)))
+            boundary = cv2.undistortPoints(boundary.reshape(-1,1,2), camintr, distcoef, P=camintr).reshape(-1,2)
+            boundary[:,0] *= size[0]/res_x
+            boundary[:,1] = (res_y-boundary[:,1])*size[1]/res_y
+            radius = float(np.max(np.linalg.norm(boundary-np.asarray(mouse), axis=1)))+2
+            def pixel_filter(pixels):
+                camera_points = np.column_stack(((pixels[:,0]*res_x/size[0]-camintr[0,2])/camintr[0,0],
+                    ((res_y-pixels[:,1]*res_y/size[1])-camintr[1,2])/camintr[1,1], np.ones(len(pixels))))
+                projected, _ = cv2.projectPoints(camera_points, np.zeros(3), np.zeros(3), camintr, distcoef)
+                return np.linalg.norm(projected.reshape(-1,2)-np.array([px,py]), axis=1) <= image_radius
+        point = depth_pick.pick_image(context, cam_pose.inverted(), projection, size, mouse, radius,
+            surface=True, pixel_filter=pixel_filter, require_surface=cam_data.ui_mode == 'MATCHMOVE')
+    return safe_ray_cast(context, cam_pose.translation, direction, include_points=False, depth_point=point)
 
 def get_track_objects(self, context):
     items = []
@@ -641,6 +677,16 @@ def set_pin_3d_provenance(pin: Any, auto_raycasted: bool, frame: int = -1, direc
 # 1. Data Structures & Settings
 # ==========================================
 class PinSolverSettings(PropertyGroup):
+    force_vertex_snap: BoolProperty(name="Always Snap to Vertex", default=False,
+        description="Snap to mesh vertices or the approximate center of displayed cloud points. Hold Alt for temporary snapping")
+    cursor_new_pins: BoolProperty(name="Add Pins at 3D Cursor", default=False,
+        description="Place new Layout pins added with the plus button at the 3D Cursor")
+    pointcloud_circle_radius: IntProperty(name="Pick Circle", default=24, min=4, max=256,
+        description="Screen radius in pixels; change with wheel or plus/minus while picking")
+    track_pick_radius: FloatProperty(name="Track Radius (%)", default=1.0, min=0.05, max=10.0,
+        description="Point cloud search radius as a percentage of the image's shorter side")
+    show_track_pick_radius: BoolProperty(name="Show Track Circles", default=False,
+        update=lambda self, context: redraw_all_3d_views(context))
     pin_radius: IntProperty(name="Pin Radius", default=6, min=1, max=20, description="Radius of the drawn pins (2D and 3D) in pixels")
     text_size: IntProperty(name="Text Size", default=14, min=8, max=32, description="Font size for the pin name labels")
     line_width: FloatProperty(name="Line Width", default=1.5, min=0.1, max=10.0, description="Thickness of the line connecting 2D and 3D pins")
@@ -914,6 +960,7 @@ class PinSolverICPSettings(PropertyGroup):
         options={'SKIP_SAVE'}
     )
     alignment_pick_index: IntProperty(default=-1, options={'SKIP_SAVE'})
+    alignment_continuous: BoolProperty(default=False, options={'SKIP_SAVE'})
     use_icp_scale_correction: BoolProperty(
         name="Pin Scale",
         default=False,
@@ -2674,6 +2721,63 @@ class PinSolverBaseOperator(Operator):
     @classmethod
     def poll(cls, context): return context.scene.camera and context.scene.camera.type == 'CAMERA'
 
+_pick_radius_handle = None
+_pick_radius_state = None
+
+
+@bpy.app.handlers.persistent
+def clear_pick_radius_overlay(*args):
+    global _pick_radius_handle, _pick_radius_state
+    depth_pick.cancel_all()
+    if _pick_radius_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(_pick_radius_handle, 'WINDOW')
+    _pick_radius_handle = None
+    _pick_radius_state = None
+    if bpy.context.workspace:
+        bpy.context.workspace.status_text_set(None)
+
+
+def draw_pick_radius_overlay():
+    state = _pick_radius_state
+    context = bpy.context
+    if state is None or context.region is None or context.region.as_pointer() != state[0]:
+        return
+    _, xy, size = state
+    draw_circle_outline(xy.x, xy.y, size, (0.85, 0.85, 0.85, 0.8))
+
+
+def update_pick_radius_overlay(context, event, targets=None):
+    global _pick_radius_handle, _pick_radius_state
+    if event.type not in {'MOUSEMOVE', 'LEFT_ALT', 'RIGHT_ALT', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE',
+            'NUMPAD_PLUS', 'NUMPAD_MINUS', 'EQUAL', 'MINUS'}:
+        return False
+    region, rv3d, x, y = get_3d_region_context(context, event, cross_window=True)
+    _pick_radius_state = None
+    if region is None or not (0 <= x < region.width and 0 <= y < region.height):
+        redraw_all_3d_views(context)
+        return False
+    is_cloud = pointcloud.has_points(context, targets)
+    context.workspace.status_text_set("Click: Pick | Esc / RMB: Cancel | Alt: Snap" +
+        (" | Wheel Up / -: Smaller | Wheel Down / +: Larger" if is_cloud else ""))
+    resized = False
+    if is_cloud:
+        settings = context.scene.pinsolver_settings
+        if event.value == 'PRESS' and event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'NUMPAD_PLUS', 'NUMPAD_MINUS', 'EQUAL', 'MINUS'}:
+            grow = event.type in {'WHEELDOWNMOUSE', 'NUMPAD_PLUS', 'EQUAL'}
+            settings.pointcloud_circle_radius = max(4, min(256, settings.pointcloud_circle_radius + (2 if grow else -2)))
+            resized = True
+        _pick_radius_state = (region.as_pointer(), Vector((x, y)), settings.pointcloud_circle_radius)
+    if _pick_radius_handle is None:
+        _pick_radius_handle = bpy.types.SpaceView3D.draw_handler_add(draw_pick_radius_overlay, (), 'WINDOW', 'POST_PIXEL')
+    redraw_all_3d_views(context)
+    return resized
+
+
+def draw_point_pick_options(layout, settings):
+    layout.separator()
+    layout.prop(settings, "force_vertex_snap")
+
+
 class PinSolverPickMixin:
     def invoke_common(self, context, target_state):
         cam_data, target_data, _ = get_active_target_data(context)
@@ -2692,12 +2796,14 @@ class PinSolverPickMixin:
         self._timer = context.window_manager.event_timer_add(0.02, window=context.window)
         
         context.window_manager.modal_handler_add(self)
+        context.workspace.status_text_set("Click: Pick | Esc / RMB: Cancel" + (" | Alt: Vertex Snap" if target_state == 'PICK_3D' else ""))
         return {'RUNNING_MODAL'}
         
     def _clean(self, context):
         if hasattr(self, '_timer') and self._timer:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
+        clear_pick_radius_overlay()
 
 class PINSOLVER_OT_toggle_show_pins(PinSolverBaseOperator):
     bl_idname = "view3d.pinsolver_toggle_show_pins"
@@ -2792,6 +2898,8 @@ class PINSOLVER_OT_add_pin(PinSolverBaseOperator):
             offset_dist = context.scene.pinsolver_settings.add_pin_offset
             offset = cam.matrix_world.to_3x3() @ Vector((0.0, 0.0, -offset_dist))
             new_pin.pos_3d = cam.matrix_world.translation + offset
+        if cam_data.ui_mode == 'LAYOUT' and context.scene.pinsolver_settings.cursor_new_pins:
+            new_pin.pos_3d = context.scene.cursor.location
             
         set_pin_idx(cam_data, target_data, idx)
         redraw_all_3d_views(context)
@@ -2961,21 +3069,27 @@ class PINSOLVER_OT_pick_2d(PinSolverBaseOperator, PinSolverPickMixin):
 class PINSOLVER_OT_pick_3d(PinSolverBaseOperator, PinSolverPickMixin):
     bl_idname = "view3d.pinsolver_pick_3d"
     bl_label = "Pick 3D"
-    bl_description = "Pick a new 3D world position for the selected pin by clicking on a mesh surface (Hold Alt to snap to vertex)"
+    bl_description = "Pick visible geometry; Alt snaps to mesh vertices or visible point-cloud depth samples"
     bl_options = {'REGISTER', 'UNDO'}
     target_index: IntProperty(default=-1)
     
     def modal(self, context, event):
         cam_data, target_data, _ = get_active_target_data(context)
+        if update_pick_radius_overlay(context, event):
+            return {'RUNNING_MODAL'}
         if not target_data or target_data.picking_state != 'PICK_3D' or target_data.picking_index != self.target_index:
             self._clean(context)
             return {'CANCELLED'}
+        if getattr(self, '_depth_request', None) is not None and event.type not in {'TIMER', 'RIGHTMOUSE', 'ESC'}:
+            return {'RUNNING_MODAL'}
             
         if event.type == 'TIMER':
             if hasattr(self, 'pick_countdown') and self.pick_countdown > 0:
                 self.pick_countdown -= 1
                 if self.pick_countdown == 0:
-                    self._do_pick(context, cam_data, target_data)
+                    if self._do_pick(context, cam_data, target_data) is False:
+                        self.pick_countdown = 1
+                        return {'RUNNING_MODAL'}
                     target_data.picking_state = 'NONE'
                     update_reproj_errors(context, cam_data, target_data, force_update=True)
                     redraw_all_3d_views(context)
@@ -3007,16 +3121,90 @@ class PINSOLVER_OT_pick_3d(PinSolverBaseOperator, PinSolverPickMixin):
         if not region or not rv3d: return
         origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
         direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-        hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=getattr(self, 'is_alt_pressed', False))
+        settings = context.scene.pinsolver_settings
+        snap = getattr(self, 'is_alt_pressed', False) or settings.force_vertex_snap
+        request = getattr(self, '_depth_request', None)
+        if request is None and pointcloud.has_points(context):
+            self._depth_request = depth_pick.Request(region, context.scene, rx, ry,
+                settings.pointcloud_circle_radius, snap, True)
+            redraw_all_3d_views(context)
+            return False
+        if request is not None and not request.done and not request.timed_out:
+            return False
+        hit, loc = safe_ray_cast(context, origin, direction, include_points=False)
+        mesh_location = loc.copy() if hit else None
+        if request is not None:
+            request.cancel()
+            self._depth_request = None
+            if request.point is not None:
+                depth_location = Vector(request.point)
+                depth_distance = (depth_location-origin).dot(direction)
+                mesh_distance = (mesh_location-origin).dot(direction) if hit else float('inf')
+                tolerance = max(1e-5, abs(depth_distance)*0.0001)
+                if depth_distance < mesh_distance-tolerance:
+                    hit, loc, mesh_location = True, depth_location, None
+            elif request.error or request.timed_out:
+                self.report({'WARNING'}, request.error or "Viewport depth read timed out")
+        if hit and mesh_location is not None and snap:
+            hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=True, include_points=False)
         
         if hit:
             pins, _ = get_pins(cam_data, target_data)
             pins[self.target_index].pos_3d = loc
             pins[self.target_index].has_valid_3d = True 
             set_pin_3d_provenance(pins[self.target_index], False)
+        else:
+            self.report({'WARNING'}, "No visible depth or mesh surface at the pick position")
+        return True
         
     def invoke(self, context, event):
         return self.invoke_common(context, 'PICK_3D')
+
+class PINSOLVER_OT_pin_from_cursor(PinSolverBaseOperator):
+    bl_idname = "view3d.pinsolver_pin_from_cursor"
+    bl_label = "Set Pin from 3D Cursor"
+    bl_description = "Set the active pin's 3D position to the 3D Cursor"
+    bl_options = {'REGISTER', 'UNDO'}
+    to_2d: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def description(cls, context, properties):
+        return "Project the 3D Cursor onto the active 2D pin in Camera View" if properties.to_2d else "Set the active 3D pin to the 3D Cursor"
+
+    def execute(self, context):
+        cam_data, target_data, _ = get_active_target_data(context)
+        if not target_data:
+            return {'CANCELLED'}
+        pins, index = get_pins(cam_data, target_data)
+        if index < 0 or index >= len(pins):
+            return {'CANCELLED'}
+        if self.to_2d:
+            region, rv3d, _, _ = get_3d_region_context(context)
+            if cam_data.ui_mode != 'LAYOUT' or rv3d is None or rv3d.view_perspective != 'CAMERA':
+                self.report({'WARNING'}, "2D cursor projection requires Camera View in Layout mode")
+                return {'CANCELLED'}
+            cursor = context.scene.cursor.location
+            camera = get_camera_unscaled_matrix(context.scene.camera, context.evaluated_depsgraph_get())
+            if (camera.inverted() @ cursor).z >= 0:
+                self.report({'WARNING'}, "3D Cursor is behind the camera")
+                return {'CANCELLED'}
+            pixel = location_3d_to_region_2d(region, rv3d, cursor)
+            bounds = get_camera_frame_bounds(context, region, rv3d)
+            if pixel is None or bounds is None:
+                return {'CANCELLED'}
+            if cam_data.use_distortion_overlay:
+                uv = mouse_to_distorted_uv(context, pixel.x, pixel.y, region, rv3d)
+            else:
+                uv = ((pixel.x-bounds[0])/(bounds[2]-bounds[0]), (pixel.y-bounds[1])/(bounds[3]-bounds[1]))
+            pins[index].pos_2d = uv
+        else:
+            pins[index].pos_3d = context.scene.cursor.location
+            pins[index].has_valid_3d = True
+            set_pin_3d_provenance(pins[index], False)
+        update_reproj_errors(context, cam_data, target_data, force_update=True)
+        redraw_all_3d_views(context)
+        return {'FINISHED'}
+
 
 class PINSOLVER_OT_auto_raycast_single(Operator):
     bl_idname = "view3d.pinsolver_auto_raycast_single"
@@ -3054,7 +3242,7 @@ class PINSOLVER_OT_auto_raycast_single(Operator):
         direction = region_2d_to_vector_3d(cam_region, cam_rv3d, px)
         if not origin or not direction: return {'CANCELLED'}
         
-        hit, loc = safe_ray_cast(context, origin, direction)
+        hit, loc = raycast_pin_from_current_camera(context, cam_data, pin)
         if hit:
             pin.pos_3d = loc
             pin.has_valid_3d = True 
@@ -3092,7 +3280,8 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
             if event.type == 'A' and cam_data.ui_mode == 'LAYOUT':
                 origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
                 direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-                hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=event.alt)
+                hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=(event.alt or context.scene.pinsolver_settings.force_vertex_snap),
+                    depth_view=(region, rv3d, rx, ry))
                 if hit:
                     idx = len(pins)
                     new_pin = pins.add()
@@ -3169,7 +3358,8 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
                 elif self.dragging_type == '3D':
                     origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
                     direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-                    hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=event.alt)
+                    hit, loc = safe_ray_cast(context, origin, direction, snap_to_vertex=(event.alt or context.scene.pinsolver_settings.force_vertex_snap),
+                        depth_view=(region, rv3d, rx, ry))
                     if hit: 
                         pin.pos_3d = loc
                         pin.has_valid_3d = True 
@@ -3300,7 +3490,9 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
             if event.type == 'A' and cam_data.ui_mode == 'LAYOUT':
                 origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
                 direction = region_2d_to_vector_3d(region, rv3d, (rx, ry))
-                hit, loc = safe_ray_cast(context, origin, direction)
+                hit, loc = safe_ray_cast(context, origin, direction,
+                    snap_to_vertex=(event.alt or context.scene.pinsolver_settings.force_vertex_snap),
+                    depth_view=(region, rv3d, rx, ry))
                 if hit:
                     idx = len(pins)
                     new_pin = pins.add()
@@ -3331,7 +3523,14 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
             elif event.type in {'X', 'I', 'T'}:
                 hover_idx = get_closest_pin_index(context, cam_data, target_data, mouse_vec, is_tweak=True, region=region, rv3d=rv3d)
                 if hover_idx != -1:
-                    if event.type == 'X' and cam_data.ui_mode == 'LAYOUT': pins.remove(hover_idx)
+                    if event.type == 'X':
+                        if cam_data.ui_mode == 'LAYOUT':
+                            pins.remove(hover_idx)
+                            set_pin_idx(cam_data, target_data, max(0, min(active_idx, len(pins) - 1)))
+                            update_reproj_errors(context, cam_data, target_data, force_update=True)
+                            redraw_all_3d_views(context)
+                            bpy.ops.ed.undo_push(message="PinSolver: Delete Pin")
+                        return {'RUNNING_MODAL'}
                     elif event.type == 'I': pins[hover_idx].use_initial = not pins[hover_idx].use_initial
                     elif event.type == 'T' and cam_data.ui_mode == 'LAYOUT': pins[hover_idx].use_tweak = not pins[hover_idx].use_tweak
                     self._trigger_solve(context, cam_data, target_data, target_obj, is_dragging=True)
@@ -3420,6 +3619,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
         if hasattr(self, '_timer') and self._timer:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
+        clear_pick_radius_overlay()
         
 # ==========================================
 # 3.5. Matchmove Engine Operators
@@ -3561,7 +3761,7 @@ class PINSOLVER_OT_auto_raycast(Operator):
             direction = region_2d_to_vector_3d(cam_region, cam_rv3d, px)
             if not origin or not direction: continue
             
-            hit, loc = safe_ray_cast(context, origin, direction)
+            hit, loc = raycast_pin_from_current_camera(context, cam_data, pin)
             if hit:
                 pin.pos_3d = loc
                 pin.has_valid_3d = True 
@@ -3742,6 +3942,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         # Pass 2 - Chain Solving
         # ----------------------------------------------------
         success_count = 0
+        insufficient_pin_frames = set()
         frames_forward = [f for f in bake_frames if f >= cam_data.reference_frame]
         frames_backward = sorted([f for f in bake_frames if f < cam_data.reference_frame], reverse=True)
         chain_pose = ref_result.copy()
@@ -3838,6 +4039,8 @@ class PINSOLVER_OT_bake_animation(Operator):
             nonlocal success_count, chain_pose, chain_frame, chain_prev_pose, chain_prev_frame, chain_prev2_pose, chain_prev2_frame
             context.scene.frame_set(f)
             context.view_layer.update()
+            if f != cam_data.reference_frame and count_active_pose_pins(context, cam_data, target_data) < min_sequence_pins:
+                insufficient_pin_frames.add(f)
             
             depsgraph = context.evaluated_depsgraph_get()
             tgt_mat = target_obj.evaluated_get(depsgraph).matrix_world if target_obj else Matrix.Identity(4)
@@ -4553,7 +4756,15 @@ class PINSOLVER_OT_bake_animation(Operator):
         reraycast_msg = f" | Reprojected: {reraycast_refined_count}" if reraycast_refined_count > 0 else ""
         refine_msg = f" | PnP Refined: {second_pass_refined_count}" if second_pass_refined_count > 0 else ""
         solver_msg = " | Camera Solver disabled" if disabled_solver_count > 0 else ""
-        self.report({'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + reraycast_msg + refine_msg + solver_msg)
+        missing_frames = sorted(set(bake_frames) - set(solved_pose_by_frame))
+        warning_parts = []
+        if insufficient_pin_frames:
+            frames = sorted(insufficient_pin_frames)
+            warning_parts.append(f"Insufficient active pins: {len(frames)} frames (first {frames[0]}, last {frames[-1]}); alignment may be unreliable")
+        if missing_frames:
+            warning_parts.append(f"Unsolved: {len(missing_frames)} frames (first {missing_frames[0]}, last {missing_frames[-1]}); existing keys/interpolation remain")
+        warning_msg = " | " + " | ".join(warning_parts) if warning_parts else ""
+        self.report({'WARNING'} if warning_parts else {'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + reraycast_msg + refine_msg + solver_msg + warning_msg)
         return {'FINISHED'}
 
 # ==========================================
@@ -4588,6 +4799,7 @@ def set_icp_status(icp_data, status: str, message: str = "", residual: float = -
 def clear_icp_pick_state(icp_data) -> None:
     icp_data.alignment_pick_role = 'NONE'
     icp_data.alignment_pick_index = -1
+    icp_data.alignment_continuous = False
 
 def is_valid_icp_rna(value: Any) -> bool:
     if value is None:
@@ -4706,8 +4918,8 @@ def object_world_bbox_diagonal(obj) -> float:
         return 1.0
 
 def get_icp_effective_sample_counts(icp_data, source=None, target=None) -> Tuple[int, int]:
-    src_polys = len(source.data.polygons) if source and getattr(source, "data", None) else 500
-    tgt_polys = len(target.data.polygons) if target and getattr(target, "data", None) else 1000
+    src_polys = len(getattr(getattr(source, "data", None), "polygons", ())) or 500
+    tgt_polys = len(getattr(getattr(target, "data", None), "polygons", ())) or 1000
     auto_source_count = min(8000, max(1500, int(src_polys * 4)))
     auto_target_count = min(16000, max(3000, int(tgt_polys * 5)))
     if icp_data.icp_quality_preset == 'FINE':
@@ -4781,8 +4993,8 @@ def validate_icp_objects(icp_data) -> Tuple[bool, str]:
         return False, "Set Source and Target mesh objects"
     if source == target:
         return False, "Source and Target must be different objects"
-    if source.type != 'MESH' or target.type != 'MESH':
-        return False, "Source and Target must be mesh objects"
+    if source.type not in {'MESH', 'POINTCLOUD'} or target.type not in {'MESH', 'POINTCLOUD'}:
+        return False, "Source and Target must be meshes or point clouds"
     return True, ""
 
 def get_icp_source_mask_options(icp_data) -> Tuple[bool, bool, str]:
@@ -4799,6 +5011,33 @@ def get_icp_source_mask_options(icp_data) -> Tuple[bool, bool, str]:
     return selected_faces, selected_vertices, vertex_group_name
 
 def sample_icp_object_points_with_normals(obj, depsgraph, use_evaluated: bool, selected_only: bool, sample_count: int, seed: int, selected_vertices_only: bool = False, vertex_group_name: str = "", cancel_event=None, focus_points: Optional[np.ndarray] = None, focus_fraction: float = 0.0) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], str]:
+    eval_obj = obj.evaluated_get(depsgraph) if use_evaluated else obj
+    mesh, cloud, geometry = pointcloud.components(eval_obj)
+    has_surface = mesh is not None and len(mesh.polygons) > 0
+    if not has_surface:
+        points = pointcloud.point_coordinates(eval_obj)
+        if selected_only:
+            return None, None, "Selected Faces requires mesh faces; use Selected Vertices or Off"
+        if selected_vertices_only or vertex_group_name:
+            if obj.type != 'MESH' or cloud is not None:
+                return None, None, "Selection and Vertex Group masks require a vertex-only mesh"
+            from .icp.geometry import _selected_vertex_indices, _vertex_group_indices
+            ids = _selected_vertex_indices(obj) if selected_vertices_only else set(range(len(points)))
+            if vertex_group_name:
+                group_ids, message = _vertex_group_indices(obj.data, obj, vertex_group_name)
+                if message:
+                    return None, None, message
+                ids &= group_ids
+            points = points[sorted(ids)]
+        if len(points) < 3:
+            return None, None, "Not enough accessible points (Geometry Nodes point output requires a supported Blender API)"
+        if cancel_event is not None and cancel_event.is_set():
+            raise IcpCancelled()
+        if len(points) > sample_count:
+            points = points[np.random.default_rng(seed).choice(len(points), sample_count, replace=False)]
+        matrix = np.asarray(eval_obj.matrix_world, dtype=np.float64)
+        points = points @ matrix[:3, :3].T + matrix[:3, 3]
+        return points, None, ""
     triangles, message = extract_world_triangles(obj, depsgraph, use_evaluated, selected_only, selected_vertices_only, vertex_group_name, cancel_event)
     if triangles is None:
         return None, None, message
@@ -4834,20 +5073,40 @@ def snap_icp_raycast_location(obj, depsgraph, matrix: Matrix, face_index: int, l
         pass
     return loc
 
-def raycast_icp_visible_pin_point(context: bpy.types.Context, source_obj: bpy.types.Object, target_obj: bpy.types.Object, origin: Vector, direction: Vector, snap_to_vertex: bool = False) -> Tuple[bool, Optional[str], Optional[bpy.types.Object], Optional[Vector]]:
+def raycast_icp_visible_pin_point(context: bpy.types.Context, source_obj: bpy.types.Object, target_obj: bpy.types.Object, origin: Vector, direction: Vector, snap_to_vertex: bool = False, depth_view=None) -> Tuple[bool, Optional[str], Optional[bpy.types.Object], Optional[Vector]]:
     scene = context.scene
     depsgraph = context.evaluated_depsgraph_get()
+    direction = direction.normalized()
+    snap_to_vertex = snap_to_vertex or context.scene.pinsolver_settings.force_vertex_snap
     cur_origin = origin + direction * PinSolverConfig.RAYCAST_START_OFFSET
+    point_hit = None
+    if depth_view is not None:
+        for target in (source_obj, target_obj):
+            if target is None or not pointcloud.has_points(context, [target]):
+                continue
+            point = depth_pick.pick_view(context, *depth_view,
+                context.scene.pinsolver_settings.pointcloud_circle_radius, snap_to_vertex, True, targets=[target])
+            if point is not None:
+                distance = (point-cur_origin).dot(direction)
+                if point_hit is None or distance < point_hit[2]:
+                    point_hit = (point, target, distance)
+    def point_result():
+        if point_hit:
+            loc, obj, _ = point_hit
+            return True, 'SOURCE' if obj == source_obj else 'TARGET', obj, loc
+        return False, None, None, None
     for _ in range(PinSolverConfig.RAYCAST_MAX_RETRIES * 4):
         hit, loc, normal, index, obj, matrix = scene.ray_cast(depsgraph, cur_origin, direction)
         if not hit:
-            return False, None, None, None
+            return point_result()
+        if point_hit and point_hit[2] < (loc-origin).dot(direction)-PinSolverConfig.RAYCAST_START_OFFSET-max(1e-5, abs(point_hit[2])*.0001):
+            return point_result()
         if is_raycast_object_match(obj, source_obj):
             return True, 'SOURCE', source_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex)
         if is_raycast_object_match(obj, target_obj):
             return True, 'TARGET', target_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex)
         cur_origin = loc + direction * 0.01
-    return False, None, None, None
+    return point_result()
 
 def icp_world_to_local(obj: bpy.types.Object, world_point: Vector) -> Tuple[Vector, bool]:
     if not obj:
@@ -4920,6 +5179,7 @@ class PINSOLVER_OT_icp_add_pin(Operator):
     bl_label = "Add Alignment Pin"
     bl_description = "Add a Source/Target correspondence pin for initial model alignment"
     bl_options = {'REGISTER', 'UNDO'}
+    continuous: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
     def _add_pin(self, context) -> int:
         icp_data = context.scene.pinsolver_icp
@@ -4944,10 +5204,29 @@ class PINSOLVER_OT_icp_add_pin(Operator):
     def invoke(self, context, event):
         idx = self._add_pin(context)
         try:
-            bpy.ops.view3d.pinsolver_icp_pick_pin_point('INVOKE_DEFAULT', point_role='SOURCE', target_index=idx, auto_next=True)
+            bpy.ops.view3d.pinsolver_icp_pick_pin_point('INVOKE_DEFAULT', point_role='SOURCE', target_index=idx, auto_next=True, continuous=self.continuous)
         except Exception:
             pass
         return {'FINISHED'}
+
+class PINSOLVER_OT_icp_continuous_pins(Operator):
+    bl_idname = "view3d.pinsolver_icp_continuous_pins"
+    bl_label = "Continuous Pin Pairs"
+    bl_description = "Continuously pick Source/Target pairs; right-click or Esc to stop"
+
+    def execute(self, context):
+        data = context.scene.pinsolver_icp
+        if data.alignment_continuous:
+            clear_icp_pick_state(data)
+            redraw_all_3d_views(context)
+            return {'FINISHED'}
+        if data.is_icp_running or not data.source_object or not data.target_object:
+            self.report({'WARNING'}, "Set Source and Target before adding pin pairs")
+            return {'CANCELLED'}
+        if data.alignment_pick_role != 'NONE':
+            self.report({'WARNING'}, "Finish or cancel the current pick first")
+            return {'CANCELLED'}
+        return bpy.ops.view3d.pinsolver_icp_add_pin('INVOKE_DEFAULT', continuous=True)
 
 class PINSOLVER_OT_icp_remove_pin(Operator):
     bl_idname = "view3d.pinsolver_icp_remove_pin"
@@ -4985,16 +5264,23 @@ class PINSOLVER_OT_icp_clear_pins(Operator):
 class PINSOLVER_OT_icp_pick_pin_point(Operator):
     bl_idname = "view3d.pinsolver_icp_pick_pin_point"
     bl_label = "Pick Alignment Pin Point"
-    bl_description = "Pick the Source or Target mesh point for the active ICP alignment pin"
+    bl_description = "Pick a Source or Target position (hold Alt to snap to a vertex or point center)"
     bl_options = {'REGISTER', 'UNDO'}
 
     point_role: StringProperty(default='SOURCE')
     target_index: IntProperty(default=-1)
     auto_next: BoolProperty(default=False)
+    continuous: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
 
     def _clear_pick_state(self, context):
+        clear_pick_radius_overlay()
         icp_data = context.scene.pinsolver_icp
         idx = self.target_index if self.target_index >= 0 else icp_data.alignment_pick_index
+        if self.continuous and 0 <= idx < len(icp_data.alignment_pins):
+            pin = icp_data.alignment_pins[idx]
+            if not pin.has_source and not pin.has_target:
+                icp_data.alignment_pins.remove(idx)
+                icp_data.alignment_pin_idx = max(0, min(idx, len(icp_data.alignment_pins)-1))
         if icp_data.alignment_pick_index == idx and icp_data.alignment_pick_role == self.point_role:
             clear_icp_pick_state(icp_data)
 
@@ -5003,6 +5289,12 @@ class PINSOLVER_OT_icp_pick_pin_point(Operator):
             self._clear_pick_state(context)
             redraw_all_3d_views(context)
             return {'CANCELLED'}
+        data = context.scene.pinsolver_icp
+        if data.alignment_pick_role != self.point_role or data.alignment_pick_index != self.target_index:
+            self._clear_pick_state(context)
+            return {'CANCELLED'}
+        if update_pick_radius_overlay(context, event, [data.source_object, data.target_object]):
+            return {'RUNNING_MODAL'}
         if event.type not in {'LEFTMOUSE', 'MOUSE_LMB_2X'} or event.value != 'PRESS':
             return {'PASS_THROUGH'}
 
@@ -5020,6 +5312,8 @@ class PINSOLVER_OT_icp_pick_pin_point(Operator):
 
         region, rv3d, rx, ry = get_3d_region_context(context, event, cross_window=True)
         if not region or not rv3d:
+            if self.continuous:
+                return {'PASS_THROUGH'}
             self._clear_pick_state(context)
             return {'CANCELLED'}
         origin = region_2d_to_origin_3d(region, rv3d, (rx, ry))
@@ -5030,10 +5324,13 @@ class PINSOLVER_OT_icp_pick_pin_point(Operator):
             icp_data.target_object,
             origin,
             direction,
-            snap_to_vertex=event.alt
+            snap_to_vertex=event.alt,
+            depth_view=(region, rv3d, rx, ry)
         )
         if not hit:
             self.report({'WARNING'}, "Raycast missed Source and Target objects")
+            if self.continuous:
+                return {'RUNNING_MODAL'}
             self._clear_pick_state(context)
             return {'CANCELLED'}
 
@@ -5055,6 +5352,16 @@ class PINSOLVER_OT_icp_pick_pin_point(Operator):
         set_icp_status(icp_data, 'NONE', "")
         redraw_all_3d_views(context)
         bpy.ops.ed.undo_push(message="PinSolver: Pick ICP Alignment Pin")
+        if self.continuous:
+            if pin.has_source and pin.has_target:
+                idx = PINSOLVER_OT_icp_add_pin._add_pin(self, context)
+                self.target_index = idx
+                self.point_role = 'SOURCE'
+            else:
+                self.point_role = 'TARGET' if pin.has_source else 'SOURCE'
+            icp_data.alignment_pick_role = self.point_role
+            icp_data.alignment_pick_index = idx
+            return {'RUNNING_MODAL'}
         self._clear_pick_state(context)
         if self.auto_next and picked_role == 'SOURCE' and not pin.has_target:
             try:
@@ -5070,12 +5377,20 @@ class PINSOLVER_OT_icp_pick_pin_point(Operator):
 
     def invoke(self, context, event):
         icp_data = context.scene.pinsolver_icp
+        if icp_data.alignment_pick_role != 'NONE':
+            clear_icp_pick_state(icp_data)
+            clear_pick_radius_overlay()
+            redraw_all_3d_views(context)
+            return {'CANCELLED'}
         idx = self.target_index if self.target_index >= 0 else icp_data.alignment_pin_idx
         if idx < 0 or idx >= len(icp_data.alignment_pins):
             self.report({'WARNING'}, "Add an Alignment Pin first")
             return {'CANCELLED'}
         icp_data.alignment_pick_role = self.point_role
         icp_data.alignment_pick_index = idx
+        icp_data.alignment_continuous = self.continuous
+        self.target_index = idx
+        context.workspace.status_text_set("Click: Pick Source / Target | Esc / RMB: Cancel | Alt: Vertex Snap")
         redraw_all_3d_views(context)
         context.window_manager.modal_handler_add(self)
         return {'RUNNING_MODAL'}
@@ -5385,6 +5700,12 @@ class PINSOLVER_OT_icp_preview(Operator):
             redraw_all_3d_views(context)
             return {'RUNNING_MODAL'}
 
+        if self._cancel_event.is_set() or _icp_runtime_state.get("input_invalidated", False):
+            self._finish_modal(context)
+            self._restore_original(context)
+            set_icp_status(icp_data, 'CANCELLED', "ICP cancelled", elapsed_seconds=time.perf_counter() - self._start_time)
+            return {'CANCELLED'}
+
         self._finish_modal(context)
 
         if self._worker_error is not None:
@@ -5574,9 +5895,9 @@ class PINSOLVER_OT_icp_set_objects_from_selection(Operator):
             self.report({'WARNING'}, "Cancel or wait for ICP to finish first")
             return {'CANCELLED'}
 
-        selected_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        selected_meshes = [obj for obj in context.selected_objects if obj.type in {'MESH', 'POINTCLOUD'}]
         if len(selected_meshes) != 2:
-            self.report({'WARNING'}, "Select exactly two mesh objects")
+            self.report({'WARNING'}, "Select exactly two meshes or point clouds")
             return {'CANCELLED'}
 
         active_object = context.active_object
@@ -5597,6 +5918,19 @@ class PINSOLVER_OT_icp_set_objects_from_selection(Operator):
 # ==========================================
 # 4. Drawing Overlays
 # ==========================================
+def draw_circle_outline(x, y, radius, color):
+    coords = [(x+radius*math.cos(t), y+radius*math.sin(t)) for t in np.linspace(0, 2*math.pi, 65)]
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = batch_for_shader(shader, 'LINE_STRIP', {"pos": coords})
+    gpu.state.blend_set('ALPHA')
+    try:
+        shader.bind()
+        shader.uniform_float('color', color)
+        batch.draw(shader)
+    finally:
+        gpu.state.blend_set('NONE')
+
+
 def draw_shape(x, y, radius, color, shape='CIRCLE'):
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
     verts, indices = [], []
@@ -5623,6 +5957,8 @@ def draw_line(x1, y1, x2, y2, color, line_width=1.0):
     except: pass
 
 def draw_callback_icp_overlay():
+    if depth_pick._rendering:
+        return
     context = bpy.context
     if not getattr(context, "space_data", None) or context.space_data.type != 'VIEW_3D': return
     icp_data = getattr(context.scene, "pinsolver_icp", None)
@@ -5704,6 +6040,8 @@ def draw_callback_icp_overlay():
     except Exception: pass
 
 def draw_callback_overlay():
+    if depth_pick._rendering:
+        return
     context = bpy.context
     if not getattr(context, "space_data", None) or context.space_data.type != 'VIEW_3D': return
     cam_data, target_data, target_obj = get_active_target_data(context)
@@ -5830,6 +6168,9 @@ def draw_callback_overlay():
                 c2d_2dpin_display = Vector(px) if px else None
             
             if c2d_2dpin_display:
+                if cam_data.ui_mode == 'MATCHMOVE' and settings.show_track_pick_radius and pin.is_track_linked:
+                    radius = min(bounds[2]-bounds[0], bounds[3]-bounds[1])*settings.track_pick_radius/100.0
+                    draw_circle_outline(c2d_2dpin_display.x, c2d_2dpin_display.y, radius, (*color[:3], 0.35))
                 if not cam_data.is_tweak_mode or cam_data.is_edit_mode:
                     draw_shape(c2d_2dpin_display.x, c2d_2dpin_display.y, current_radius, color, 'CIRCLE')
                     if draw_name:
@@ -5878,16 +6219,11 @@ class PINSOLVER_UL_icp_pins(UIList):
         r_name.prop(item, "name", text="", emboss=False)
         pick_row = split_main.row(align=True)
         pick_row.operator_context = 'INVOKE_DEFAULT'
-        is_source_pick = icp_data.alignment_pick_role == 'SOURCE' and icp_data.alignment_pick_index == index
-        is_target_pick = icp_data.alignment_pick_role == 'TARGET' and icp_data.alignment_pick_index == index
-        op = pick_row.operator("view3d.pinsolver_icp_pick_pin_point", text="", icon='OBJECT_ORIGIN', depress=is_source_pick)
+        picking = icp_data.alignment_pick_role != 'NONE' and icp_data.alignment_pick_index == index
+        op = pick_row.operator("view3d.pinsolver_icp_pick_pin_point", text="", icon='EYEDROPPER', depress=picking)
         op.point_role = 'SOURCE'
         op.target_index = index
-        op.auto_next = True
-        op = pick_row.operator("view3d.pinsolver_icp_pick_pin_point", text="", icon='RESTRICT_SELECT_OFF', depress=is_target_pick)
-        op.point_role = 'TARGET'
-        op.target_index = index
-        op.auto_next = not item.has_source
+        op.auto_next = not (item.has_source and item.has_target)
 
 class PINSOLVER_UL_pins(UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
@@ -6033,6 +6369,8 @@ class PINSOLVER_PT_panel(Panel):
                 cp.operator("view3d.pinsolver_add_pin", icon='ADD', text="")
                 if pins: 
                     cp.operator("view3d.pinsolver_remove_pin", icon='REMOVE', text="")
+                cp.prop(context.scene.pinsolver_settings, "cursor_new_pins", text="", icon='CURSOR', toggle=True)
+                if pins:
                     cp.separator()
                     cp.operator("view3d.pinsolver_clear_pins", icon='TRASH', text="")
                     
@@ -6063,14 +6401,21 @@ class PINSOLVER_PT_panel(Panel):
 
                 if cam_data.ui_mode == 'LAYOUT':
                     cd = box.column(align=True)
-                    r2 = cd.row(align=True)
+                    r2 = cd.split(factor=0.28, align=True)
                     r2.label(text="2D(●):")
+                    r2 = r2.row(align=True)
                     op2d = r2.operator("view3d.pinsolver_pick_2d", text="Pick 2D", icon='EYEDROPPER', depress=(target_data.picking_state=='PICK_2D'))
                     op2d.target_index = active_idx
-                    r3 = cd.row(align=True)
+                    cursor_row = r2.row(align=True)
+                    _, cursor_view, _, _ = get_3d_region_context(context)
+                    cursor_row.enabled = cursor_view is not None and cursor_view.view_perspective == 'CAMERA'
+                    cursor_row.operator("view3d.pinsolver_pin_from_cursor", text="", icon='CURSOR').to_2d = True
+                    r3 = cd.split(factor=0.28, align=True)
                     r3.label(text="3D(■):")
+                    r3 = r3.row(align=True)
                     op3d = r3.operator("view3d.pinsolver_pick_3d", text="Pick 3D", icon='EYEDROPPER', depress=(target_data.picking_state=='PICK_3D'))
                     op3d.target_index = active_idx
+                    r3.operator("view3d.pinsolver_pin_from_cursor", text="", icon='CURSOR').to_2d = False
                 else:
                     cd = box.column(align=True)
                     r3 = cd.row(align=True)
@@ -6365,6 +6710,10 @@ class PINSOLVER_PT_panel(Panel):
             col.prop(settings, "overlay_opacity")
             col.separator()
             col.prop(settings, "add_pin_offset")
+            draw_point_pick_options(col, settings)
+            if cam_data.ui_mode == 'MATCHMOVE':
+                col.prop(settings, "track_pick_radius")
+                col.prop(settings, "show_track_pick_radius")
 
 class PINSOLVER_PT_icp_panel(Panel):
     bl_space_type = 'VIEW_3D'
@@ -6397,11 +6746,14 @@ class PINSOLVER_PT_icp_panel(Panel):
         row.template_list("PINSOLVER_UL_icp_pins", "", icp_data, "alignment_pins", icp_data, "alignment_pin_idx", rows=3)
         buttons = row.column(align=True)
         buttons.operator_context = 'INVOKE_DEFAULT'
-        buttons.operator("view3d.pinsolver_icp_add_pin", icon='ADD', text="")
-        buttons.operator("view3d.pinsolver_icp_remove_pin", icon='REMOVE', text="")
-        buttons.operator("view3d.pinsolver_icp_clear_pins", icon='TRASH', text="")
+        buttons.operator("view3d.pinsolver_icp_continuous_pins", icon='REC', text="", depress=icp_data.alignment_continuous)
+        edits = buttons.column(align=True)
+        edits.enabled = not icp_data.alignment_continuous
+        edits.operator("view3d.pinsolver_icp_add_pin", icon='ADD', text="")
+        edits.operator("view3d.pinsolver_icp_remove_pin", icon='REMOVE', text="")
+        edits.operator("view3d.pinsolver_icp_clear_pins", icon='TRASH', text="")
         if icp_data.alignment_pick_role != 'NONE':
-            pins_box.label(text=f"Picking {icp_data.alignment_pick_role.title()} point", icon='EYEDROPPER')
+            pins_box.label(text="Picking Source / Target", icon='EYEDROPPER')
         if icp_data.alignment_pins and 0 <= icp_data.alignment_pin_idx < len(icp_data.alignment_pins):
             pin = icp_data.alignment_pins[icp_data.alignment_pin_idx]
             pin_col = pins_box.column(align=True)
@@ -6454,6 +6806,7 @@ class PINSOLVER_PT_icp_panel(Panel):
             adv = layout.column(align=True)
             adv.enabled = controls_enabled
             adv.label(text="Geometry")
+            draw_point_pick_options(adv, context.scene.pinsolver_settings)
             row = adv.row(align=True)
             row.prop(icp_data, "use_evaluated_source", text="Source Eval")
             row.prop(icp_data, "use_evaluated_target", text="Target Eval")
@@ -6516,12 +6869,28 @@ class PinSolverAddon:
     @classmethod
     def register(cls):
         for c in classes: bpy.utils.register_class(c)
+        bpy.app.handlers.depsgraph_update_post.append(depth_pick.invalidate)
+        bpy.app.handlers.load_pre.append(depth_pick.invalidate)
+        bpy.app.handlers.undo_post.append(depth_pick.invalidate)
+        bpy.app.handlers.redo_post.append(depth_pick.invalidate)
+        for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre, bpy.app.handlers.load_pre):
+            if clear_pick_radius_overlay not in handlers:
+                handlers.append(clear_pick_radius_overlay)
         bpy.types.Object.pinsolver_data = bpy.props.PointerProperty(type=PinSolverData)
         bpy.types.Scene.pinsolver_settings = bpy.props.PointerProperty(type=PinSolverSettings)
         bpy.types.Scene.pinsolver_icp = bpy.props.PointerProperty(type=PinSolverICPSettings)
 
     @classmethod
     def unregister(cls):
+        for handlers in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_pre,
+                bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+            if depth_pick.invalidate in handlers:
+                handlers.remove(depth_pick.invalidate)
+        depth_pick.release()
+        for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre, bpy.app.handlers.load_pre):
+            if clear_pick_radius_overlay in handlers:
+                handlers.remove(clear_pick_radius_overlay)
+        clear_pick_radius_overlay()
         global _draw_handle, _icp_draw_handle
         if _draw_handle is not None:
             bpy.types.SpaceView3D.draw_handler_remove(_draw_handle, 'WINDOW')
@@ -6539,12 +6908,12 @@ classes = (
     PinSolverSettings, PinSolverPin, PinSolverTargetItem, PinSolverData, PinSolverICPPin, PinSolverICPSettings,
     PINSOLVER_OT_toggle_show_pins, PINSOLVER_OT_set_solve_target, PINSOLVER_OT_toggle_pin_mode,
     PINSOLVER_UL_targets, PINSOLVER_UL_icp_pins, PINSOLVER_UL_pins, PINSOLVER_UL_mm_pins, PINSOLVER_OT_add_target, PINSOLVER_OT_remove_target,
-    PINSOLVER_OT_pick_2d, PINSOLVER_OT_pick_3d, PINSOLVER_OT_auto_raycast_single, PINSOLVER_OT_sync_clip, PINSOLVER_OT_clear_pins,
+    PINSOLVER_OT_pick_2d, PINSOLVER_OT_pick_3d, PINSOLVER_OT_pin_from_cursor, PINSOLVER_OT_auto_raycast_single, PINSOLVER_OT_sync_clip, PINSOLVER_OT_clear_pins,
     PINSOLVER_OT_add_pin, PINSOLVER_OT_remove_pin, PINSOLVER_OT_solve, 
     PINSOLVER_OT_edit_pins, PINSOLVER_OT_tweak, PINSOLVER_PT_panel,
     PINSOLVER_OT_send_to_layout, PINSOLVER_OT_sync_trackers, PINSOLVER_OT_auto_raycast, PINSOLVER_OT_set_reference_frame,
     PINSOLVER_OT_bake_animation,
-    PINSOLVER_OT_icp_add_pin, PINSOLVER_OT_icp_remove_pin, PINSOLVER_OT_icp_clear_pins, PINSOLVER_OT_icp_pick_pin_point,
+    PINSOLVER_OT_icp_add_pin, PINSOLVER_OT_icp_continuous_pins, PINSOLVER_OT_icp_remove_pin, PINSOLVER_OT_icp_clear_pins, PINSOLVER_OT_icp_pick_pin_point,
     PINSOLVER_OT_icp_preview_pin_alignment,
     PINSOLVER_OT_icp_preview, PINSOLVER_OT_icp_cancel, PINSOLVER_OT_icp_apply, PINSOLVER_OT_icp_revert, PINSOLVER_OT_icp_swap_objects, PINSOLVER_OT_icp_set_objects_from_selection,
     PINSOLVER_PT_icp_panel
