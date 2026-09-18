@@ -133,4 +133,4 @@ PinSolver includes two distinct modes depending on your objective:
 **A:** Do you have any `Lens Calibration` options (like Focal Length) checked? If enabled, the solver tries to absorb the discrepancy by changing the zoom or lens distortion rather than just translating the camera. For smooth positional tweaking, it is highly recommended to perform an initial solve to determine your lens values, and then **uncheck all calibration options** before entering Tweak mode.
 
 ## License
-CV Auto Track is GPL-3.0-or-later. OpenCV is Apache-2.0 licensed.
+PinSolver is GPL-3.0-or-later. OpenCV is Apache-2.0 licensed.
