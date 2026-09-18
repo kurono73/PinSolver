@@ -37,7 +37,7 @@ PinSolver includes two distinct modes depending on your objective:
 * **Clear All Pins:** A single trash can button safely and instantly resets all accumulated pins.
 
 ### ☁️ Point Cloud Support
-* Point Cloud Support: Point clouds are supported across Layout Mode, Matchmove Mode, and Pin Align, including direct viewport picking.
+* Point clouds are supported across Layout Mode, Matchmove Mode, and Pin Align, including direct viewport picking.
 
 ### 📐 Pin Align
 * Aligns a Source mesh or point cloud to a Target mesh or point cloud from matching 3D pin pairs, with optional ICP refinement.
@@ -121,14 +121,14 @@ PinSolver includes two distinct modes depending on your objective:
 ## Q&A / Troubleshooting
 
 **Q: Pressing 'A' in the Interactive Pin Editor or Tweak mode doesn't add a pin.**  
-**A:** To add a pin, there must be a 3D geometry(mesh or point cloud) directly under your cursor along the camera's line of sight. Pins cannot be raycasted into empty space (e.g., just the background image). Ensure your cursor is hovering over a 3D surface before pressing 'A'.
+**A:** To add a pin, there must be 3D geometry (mesh or point cloud) directly under your cursor along the camera's line of sight. Pins cannot be raycasted into empty space (e.g., just the background image). EEnsure your cursor is hovering over visible 3D geometry before pressing 'A'.
 
 **Q: The alignment doesn't match up correctly when I click `Solve Alignment`.**  
 **A:** There are several potential causes for this issue:
 * If your camera has a `Camera Solver` constraint applied or contains complex keyframe animations, parent the camera to an Empty and change the **Solve Target** to **`Parent`**.
 * Your camera settings (focal length, sensor size) might be incorrect. Consider using the Lens Calibration feature to estimate the correct values.
 * The geometry or scale of the target 3D object might not accurately match the real-world object.
-* The 3D Pin positions might be slightly misaligned on the mesh surface.
+* The 3D Pin positions might be slightly misaligned with the target geometry.
 
 **Q: The Lens Calibration checkboxes (Focal Length, etc.) are locked and cannot be clicked.**  
 **A:** Due to mathematical constraints, automatic lens calibration requires a minimum of **6 active pins**. Add more pins to your scene to enable these options.
