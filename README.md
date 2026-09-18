@@ -113,7 +113,7 @@ PinSolver includes two distinct modes depending on your objective:
 1. In the 3D Viewport sidebar, open the **PinSolver > Pin Align** panel.
 2. Set the mesh or point cloud to move as **Source** and the reference geometry as **Target**. With two supported objects selected, the selection button assigns the active object as Target.
 3. Add at least three **Alignment Pins**. Pick matching points on both objects; Source and Target points can be picked in either order. Use Continuous Pin Pair mode (●) to create multiple pairs consecutively. Hold Alt while picking to snap to mesh vertices or Point Cloud points.
-4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the meshes need a uniform scale adjustment. Pin Scale estimates uniform scale from the Alignment Pins, while ICP Scale allows ICP refinement itself to adjust uniform scale.  
+4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the Source needs a uniform scale adjustment. Pin Scale estimates uniform scale from the Alignment Pins, while ICP Scale allows ICP refinement itself to adjust uniform scale.  
 5. Use **Preview ICP** to refine the Source against the Target. Set a **Source Mask** when only part of the Source should contribute to the match. For meshes, the Source Mask can restrict ICP to selected faces, selected vertices, or a vertex group. Point-cloud sources do not support face-based masks.
 6. Click **Apply** to keep the previewed transform, or **Revert** to restore the Source transform.
 
@@ -121,7 +121,7 @@ PinSolver includes two distinct modes depending on your objective:
 ## Q&A / Troubleshooting
 
 **Q: Pressing 'A' in the Interactive Pin Editor or Tweak mode doesn't add a pin.**  
-**A:** To add a pin, there must be 3D geometry (mesh or point cloud) directly under your cursor along the camera's line of sight. Pins cannot be raycasted into empty space (e.g., just the background image). EEnsure your cursor is hovering over visible 3D geometry before pressing 'A'.
+**A:** To add a pin, there must be 3D geometry (mesh or point cloud) directly under your cursor along the camera's line of sight. Pins cannot be raycasted into empty space (e.g., just the background image). Ensure your cursor is hovering over visible 3D geometry before pressing 'A'.
 
 **Q: The alignment doesn't match up correctly when I click `Solve Alignment`.**  
 **A:** There are several potential causes for this issue:
