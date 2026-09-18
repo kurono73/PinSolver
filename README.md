@@ -37,7 +37,10 @@ PinSolver includes two distinct modes depending on your objective:
 * **Clear All Pins:** A single trash can button safely and instantly resets all accumulated pins.
 
 ### 📐 Pin Align
-* Aligns a Source mesh to a Target mesh from matching 3D pin pairs, with optional ICP refinement.
+* Aligns a Source mesh or point cloud to a Target mesh or point cloud from matching 3D pin pairs, with optional ICP refinement.
+
+### ☁️ Point Cloud Support
+* Mesh / Point Cloud Support: Source and Target can be meshes or point clouds. Point-cloud geometry can also be picked directly in the viewport.
 
 ---
 
@@ -107,10 +110,10 @@ PinSolver includes two distinct modes depending on your objective:
 
 ### Pin Align (3D Model Alignment)
 1. In the 3D Viewport sidebar, open the **PinSolver > Pin Align** panel.
-2. Set the mesh to move as **Source** and the reference mesh as **Target**. With two meshes selected, the selection button assigns the active mesh as Target.
-3. Add at least three **Alignment Pins**. Pick matching points on both meshes; Source and Target points can be picked in either order.
-4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the meshes need a uniform scale adjustment.
-5. Use **Preview ICP** to refine the Source against the Target. Set a **Source Mask** when only part of the Source should contribute to the match.
+2. Set the mesh or point cloud to move as **Source** and the reference geometry as **Target**. With two meshes or point clouds selected, the selection button assigns the active object as Target.
+3. Add at least three **Alignment Pins**. Pick matching points on both objects; Source and Target points can be picked in either order. Use Continuous Pin Pair mode (●) to create multiple pairs consecutively. Hold Alt while picking to snap to mesh vertices or Point Cloud points.
+4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the meshes need a uniform scale adjustment.Pin Scale estimates uniform scale from the Alignment Pins, while ICP Scale allows ICP refinement itself to adjust uniform scale.
+5. Use **Preview ICP** to refine the Source against the Target. Set a **Source Mask** when only part of the Source should contribute to the match.For meshes, the Source Mask can restrict ICP to selected faces, selected vertices, or a vertex group. Point-cloud sources do not support face-based masks.
 6. Click **Apply** to keep the previewed transform, or **Revert** to restore the Source transform.
 
 
