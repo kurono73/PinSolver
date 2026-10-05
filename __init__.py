@@ -7,7 +7,7 @@ import blf
 from bpy.props import (StringProperty, FloatVectorProperty, CollectionProperty, 
                        IntProperty, BoolProperty, EnumProperty, PointerProperty, FloatProperty)
 from bpy.types import PropertyGroup, Operator, Panel, UIList
-from mathutils import Vector, Matrix
+from mathutils import Vector, Matrix, Euler
 from bpy_extras.view3d_utils import region_2d_to_origin_3d, region_2d_to_vector_3d, location_3d_to_region_2d
 import numpy as np
 import colorsys
@@ -153,7 +153,17 @@ def get_cv_camera_params(context: bpy.types.Context, cam_data: Any) -> Tuple[np.
     if clip:
         clipcam = clip.tracking.camera
         focal = clipcam.focal_length_pixels
+        camera_obj = context.scene.camera
+        if cam_data.ui_mode == 'MATCHMOVE' and camera_obj and keyed_fcurves_for_path(camera_obj.data, "lens"):
+            focal *= camera_obj.data.lens / max(1e-8, clipcam.focal_length)
         optcent = clipcam.principal if bpy.app.version < (3, 5, 0) else clipcam.principal_point_pixels
+        optcent = list(optcent)
+        if cam_data.ui_mode == 'MATCHMOVE' and camera_obj:
+            max_size = max(clip.size)
+            if keyed_fcurves_for_path(camera_obj.data, "shift_x"):
+                optcent[0] = clip.size[0] / 2.0 + camera_obj.data.shift_x * max_size
+            if keyed_fcurves_for_path(camera_obj.data, "shift_y"):
+                optcent[1] = clip.size[1] / 2.0 + camera_obj.data.shift_y * max_size
             
         camintr = np.array([
             [focal, 0, optcent[0]],
@@ -788,6 +798,144 @@ def update_icp_quality_preset(self, context):
         return
     self.source_sample_count, self.target_sample_count, self.iterations, self.tolerance, self.max_correspondence_distance, self.rejection_scale, self.trim_fraction, self.pyramid_levels, self.icp_refinement_method, self.icp_tangent_weight, self.icp_coverage_balance = values
 
+def get_sequence_frame_range(context, cam_data):
+    if cam_data.use_custom_range:
+        return min(cam_data.bake_start, cam_data.bake_end), max(cam_data.bake_start, cam_data.bake_end)
+    if cam_data.bake_target == 'MARKERS':
+        frames = [m.frame for m in context.scene.timeline_markers]
+        if frames:
+            return min(frames), max(frames)
+    return context.scene.frame_start, context.scene.frame_end
+
+
+def snapshot_range_boundaries(id_block, paths, start, end):
+    snapshots = []
+    for curve in action_fcurves_for_datablock(id_block):
+        if curve.data_path not in paths or not curve.keyframe_points:
+            continue
+        keys = [(tuple(k.co), tuple(k.handle_left), tuple(k.handle_right),
+                 k.interpolation, k.handle_left_type, k.handle_right_type)
+                for k in curve.keyframe_points]
+        guards = []
+        for frame, left_side in ((start - 1, True), (end + 1, False)):
+            outer_keys = [k for k in keys if k[0][0] <= frame] if left_side else [k for k in keys if k[0][0] >= frame]
+            if not outer_keys:
+                continue
+            left = next((k for k in reversed(keys) if k[0][0] < frame), None)
+            right = next((k for k in keys if k[0][0] > frame), None)
+            existing = next((k for k in keys if k[0][0] == frame), None)
+            if existing:
+                guards.append((frame, existing[0][1], left_side, existing[1], existing[2], None, None, existing[3]))
+            elif left and right and left[3] == 'BEZIER':
+                p0, p1, p2, p3 = [np.array(p, dtype=float) for p in (left[0], left[2], right[1], right[0])]
+                # Match Blender's horizontal handle clipping before subdividing.
+                span = p3[0] - p0[0]
+                handle_span = abs(p1[0]-p0[0]) + abs(p3[0]-p2[0])
+                if handle_span > span:
+                    p1 = p0 + (p1-p0) * span / handle_span
+                    p2 = p3 + (p2-p3) * span / handle_span
+                lo, hi = 0.0, 1.0
+                for _ in range(50):
+                    t = (lo+hi)/2
+                    point = (1-t)**3*p0 + 3*(1-t)**2*t*p1 + 3*(1-t)*t*t*p2 + t**3*p3
+                    if point[0] < frame:
+                        lo = t
+                    else:
+                        hi = t
+                a, b, c = (1-t)*p0+t*p1, (1-t)*p1+t*p2, (1-t)*p2+t*p3
+                d, e = (1-t)*a+t*b, (1-t)*b+t*c
+                point = (1-t)*d+t*e
+                neighbor = (left[0][0], tuple(a)) if left_side else (right[0][0], tuple(c))
+                guards.append((frame, float(point[1]), left_side, tuple(d), tuple(e), neighbor, left[3], 'BEZIER'))
+            elif left and right and left[3] in {'LINEAR', 'CONSTANT'}:
+                value = left[0][1] if left[3] == 'CONSTANT' else left[0][1] + (right[0][1]-left[0][1])*(frame-left[0][0])/(right[0][0]-left[0][0])
+                guards.append((frame,value,left_side,None,None,None,left[3],left[3]))
+            elif not left or not right:
+                endpoint = keys[0] if not left else keys[-1]
+                value = endpoint[0][1]
+                if curve.extrapolation == 'LINEAR':
+                    handle = endpoint[1] if not left else endpoint[2]
+                    dx = handle[0]-endpoint[0][0]
+                    if abs(dx) > 1e-8:
+                        value += (frame-endpoint[0][0])*(handle[1]-endpoint[0][1])/dx
+                guards.append((frame,value,left_side,None,None,None,None,'LINEAR'))
+        snapshots.append((curve, keys, guards))
+    return snapshots
+
+
+def restore_range_boundaries(snapshots, start, end):
+    for curve, originals, guards in snapshots:
+        keys = {float(k.co.x): k for k in curve.keyframe_points}
+        adjacent_frames = {guard[5][0] for guard in guards if guard[5]}
+        for co, hl, hr, interpolation, lt, rt in originals:
+            if start <= co[0] <= end or co[0] not in keys:
+                continue
+            key = keys[co[0]]
+            key.co = co
+            key.interpolation = interpolation
+            # Freeze only handles changed by the newly inserted neighboring keys.
+            if co[0] in adjacent_frames or (Vector(key.handle_left)-Vector(hl)).length > 1e-6:
+                key.handle_left_type = 'FREE'
+                key.handle_left = hl
+            if co[0] in adjacent_frames or (Vector(key.handle_right)-Vector(hr)).length > 1e-6:
+                key.handle_right_type = 'FREE'
+                key.handle_right = hr
+        for frame, value, left_side, hl, hr, neighbor, previous_interp, interpolation in guards:
+            key = curve.keyframe_points.insert(frame,value,options={'FAST'})
+            key.interpolation = interpolation
+            key.handle_left_type = 'FREE' if left_side and hl else 'VECTOR'
+            key.handle_right_type = 'FREE' if not left_side and hr else 'VECTOR'
+            if left_side and hl:
+                key.handle_left = hl
+            if not left_side and hr:
+                key.handle_right = hr
+            if neighbor:
+                adjacent = next(k for k in curve.keyframe_points if k.co.x == neighbor[0])
+                if left_side:
+                    adjacent.handle_right_type = 'FREE'
+                    adjacent.handle_right = neighbor[1]
+                else:
+                    adjacent.handle_left_type = 'FREE'
+                    adjacent.handle_left = neighbor[1]
+            if left_side and previous_interp:
+                previous = [k for k in curve.keyframe_points if k.co.x < frame]
+                if previous:
+                    max(previous,key=lambda k:k.co.x).interpolation = previous_interp
+        curve.update()
+
+
+def get_sequence_reference_frame(context, cam_data):
+    if cam_data.use_reference_frame_lock:
+        return cam_data.reference_frame
+    start, end = get_sequence_frame_range(context, cam_data)
+    return max(start, min(end, context.scene.frame_current))
+
+
+def update_sequence_reference_lock(self, context):
+    if self.use_reference_frame_lock:
+        start, end = get_sequence_frame_range(context, self)
+        self.reference_frame = max(start, min(end, context.scene.frame_current))
+
+
+def update_sequence_range_preview(self, context):
+    if self.use_custom_range and self.custom_range_use_preview:
+        start, end = get_sequence_frame_range(context, self)
+        context.scene.use_preview_range = True
+        context.scene.frame_preview_start = start
+        context.scene.frame_preview_end = end
+        self.custom_range_preview_active = True
+    elif self.custom_range_preview_active:
+        context.scene.use_preview_range = False
+        self.custom_range_preview_active = False
+
+
+def update_sequence_custom_range(self, context):
+    if self.use_custom_range and not self.is_property_set("bake_start") and not self.is_property_set("bake_end"):
+        self.bake_start = context.scene.frame_start
+        self.bake_end = context.scene.frame_end
+    update_sequence_range_preview(self, context)
+
+
 class PinSolverData(PropertyGroup):
     picking_state: EnumProperty(items=[('NONE', "", ""), ('PICK_2D', "", ""), ('PICK_3D', "", "")], default='NONE')
     picking_index: IntProperty(default=-1)
@@ -822,6 +970,14 @@ class PinSolverData(PropertyGroup):
     mm_pin_idx: IntProperty(default=0, description="Active Matchmove Track - Select a tracked pin to view or edit its coordinates")
     
     reference_frame: IntProperty(name="Reference Frame", default=1, description="The frame where 3D Pins are perfectly aligned to the scene")
+    use_reference_frame_lock: BoolProperty(name="Lock Reference Frame", default=True,
+        description="Keep the stored reference instead of using the current timeline frame", update=update_sequence_reference_lock)
+    use_custom_range: BoolProperty(name="Custom Range", default=False, update=update_sequence_custom_range)
+    custom_range_use_preview: BoolProperty(name="Preview Range", default=True,
+        description="Display the Custom Range on the timeline", update=update_sequence_range_preview)
+    custom_range_preview_active: BoolProperty(default=False, options={'HIDDEN', 'SKIP_SAVE'})
+    bake_start: IntProperty(name="In", default=1, update=update_sequence_range_preview)
+    bake_end: IntProperty(name="Out", default=250, update=update_sequence_range_preview)
     bake_target: EnumProperty(
         name="Bake Range",
         items=[('SCENE', "Scene Range", "Bake using the scene's start and end frames"), 
@@ -935,7 +1091,7 @@ class PinSolverData(PropertyGroup):
                ('MEDIAN', "Median All Frames", "Calculate median intrinsics across bake range")],
         default='MEDIAN'
     )
-    use_dynamic_zoom: BoolProperty(name="Zooming", default=False, description="Keyframe this to toggle between Static lens and Dynamic Zoom per frame")
+    use_dynamic_zoom: BoolProperty(name="Zooming", default=True, description="Keyframe this to toggle between Static lens and Dynamic Zoom per frame")
 
 class PinSolverICPPin(PropertyGroup):
     name: StringProperty(name="Name", default="Align Pin")
@@ -1251,10 +1407,12 @@ def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[An
                 if cam_data.calib_optical_center:
                     cx_cv = float(camintr_new[0, 2])
                     cy_cv = float(camintr_new[1, 2])
-                    px = res_x / 2.0 - cx_cv
-                    py = res_y / 2.0 - cy_cv
+                    px = cx_cv
+                    py = res_y - cy_cv
                     if bpy.app.version < (3, 5, 0): trk_cam.principal = [px, py]
                     else: trk_cam.principal_point_pixels = [px, py]
+                    cam_data_ref.shift_x = (cx_cv - res_x / 2.0) / max(res_x, res_y)
+                    cam_data_ref.shift_y = (res_y / 2.0 - cy_cv) / max(res_x, res_y)
                 if cam_data.calib_k1 and zoom_base_intrinsics is None: trk_cam.k1 = float(distcoef_new[0])
                 if cam_data.calib_k2 and zoom_base_intrinsics is None: trk_cam.k2 = float(distcoef_new[1])
                 if cam_data.calib_k3 and zoom_base_intrinsics is None: trk_cam.k3 = float(distcoef_new[4])
@@ -1369,8 +1527,7 @@ def is_auto_keying_enabled(context: bpy.types.Context) -> bool:
         return False
     return bool(
         getattr(tool_settings, "use_keyframe_insert_auto", False) or
-        getattr(tool_settings, "use_keyframe_insert", False) or
-        getattr(tool_settings, "use_keyframe_insert_keyingset", False)
+        getattr(tool_settings, "use_keyframe_insert", False)
     )
 
 def get_rotation_key_path(obj: bpy.types.Object) -> str:
@@ -1466,15 +1623,25 @@ def get_solve_transform_target(cam_data: Any, camera_obj: bpy.types.Object, targ
         return camera_obj.parent if camera_obj else None
     return camera_obj
 
-def auto_key_solve_result(context: bpy.types.Context, cam_data: Any, camera_obj: bpy.types.Object, target_obj: Optional[bpy.types.Object], include_camera_data: bool = False) -> int:
+def auto_key_solve_result(context: bpy.types.Context, cam_data: Any, camera_obj: bpy.types.Object, target_obj: Optional[bpy.types.Object], include_camera_data: bool = False, create_transform_keys: bool = False) -> int:
     if not is_auto_keying_enabled(context):
         return 0
     frame = int(context.scene.frame_current)
     keyed_count = 0
     obj_to_key = get_solve_transform_target(cam_data, camera_obj, target_obj)
     if obj_to_key:
-        keyed_count += key_existing_array_channels(obj_to_key, "location", frame)
-        keyed_count += key_existing_array_channels(obj_to_key, get_rotation_key_path(obj_to_key), frame)
+        if create_transform_keys:
+            for path in ("location", get_rotation_key_path(obj_to_key)):
+                if context.scene.tool_settings.auto_keying_mode == 'REPLACE_KEYS':
+                    for curve in keyed_fcurves_for_path(obj_to_key, path):
+                        if any(abs(key.co.x-frame) < 1e-5 for key in curve.keyframe_points):
+                            keyed_count += int(obj_to_key.keyframe_insert(data_path=path, index=curve.array_index,
+                                frame=frame, options={'INSERTKEY_REPLACE'}))
+                else:
+                    keyed_count += int(obj_to_key.keyframe_insert(data_path=path, frame=frame))
+        else:
+            keyed_count += key_existing_array_channels(obj_to_key, "location", frame)
+            keyed_count += key_existing_array_channels(obj_to_key, get_rotation_key_path(obj_to_key), frame)
     if include_camera_data and camera_obj and camera_obj.data:
         keyed_count += key_existing_scalar_channel(camera_obj.data, "lens", frame)
         keyed_count += key_existing_scalar_channel(camera_obj.data, "shift_x", frame)
@@ -2661,6 +2828,38 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
         target_data.last_error = f"Err: {type(e).__name__} {str(e)[:20]}"
         return False, None
 
+def set_world_matrix_continuous(obj, matrix):
+    previous = obj.rotation_euler.copy()
+    obj.matrix_world = matrix
+    if obj.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
+        obj.rotation_euler = obj.rotation_euler.to_quaternion().to_euler(obj.rotation_mode, previous)
+
+
+def make_baked_euler_continuous(obj, frames, reference_frame, reference_euler):
+    if obj is None or obj.rotation_mode in {'QUATERNION', 'AXIS_ANGLE'}:
+        return
+    curves = {fc.array_index: fc for fc in keyed_fcurves_for_path(obj, 'rotation_euler')}
+    if not all(i in curves for i in range(3)):
+        return
+    keys = {i: {round(k.co.x, 5): k for k in curves[i].keyframe_points} for i in range(3)}
+    frames = sorted(f for f in set(frames) if all(round(f, 5) in keys[i] for i in range(3)))
+    for sequence in ([f for f in frames if f >= reference_frame],
+                     [f for f in reversed(frames) if f < reference_frame]):
+        previous = reference_euler.copy()
+        for frame in sequence:
+            points = [keys[i][round(frame, 5)] for i in range(3)]
+            rotation = Euler(tuple(k.co.y for k in points), obj.rotation_mode)
+            compatible = rotation.to_quaternion().to_euler(obj.rotation_mode, previous)
+            for i, key in enumerate(points):
+                delta = compatible[i] - key.co.y
+                key.co.y += delta
+                key.handle_left.y += delta
+                key.handle_right.y += delta
+            previous = compatible
+    for curve in curves.values():
+        curve.update()
+
+
 def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: Any, camera_obj: bpy.types.Object, target_obj: bpy.types.Object, result_matrix: Matrix, parent_camera_local_matrix: Optional[Matrix] = None) -> bool:
     try:
         depsgraph = context.evaluated_depsgraph_get()
@@ -2678,7 +2877,7 @@ def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: A
             orig_scale = target_obj.matrix_world.to_scale()
             new_mat = delta_M @ target_world
             loc, rot, _ = new_mat.decompose()
-            target_obj.matrix_world = Matrix.LocRotScale(loc, rot, orig_scale)
+            set_world_matrix_continuous(target_obj, Matrix.LocRotScale(loc, rot, orig_scale))
             pins, _ = get_pins(cam_data, target_data)
             for pin in pins: pin.pos_3d = delta_M @ Vector(pin.pos_3d)
             return True
@@ -2702,12 +2901,12 @@ def apply_solve_result(context: bpy.types.Context, cam_data: Any, target_data: A
             try: M_parent_world_target = M_cam_world_target @ M_cam_local.inverted()
             except ValueError: return False
             
-            parent_obj.matrix_world = M_parent_world_target
+            set_world_matrix_continuous(parent_obj, M_parent_world_target)
             return True
             
         else: # CAMERA
             loc, rot, _ = result_matrix.decompose()
-            camera_obj.matrix_world = Matrix.LocRotScale(loc, rot, cam_scale)
+            set_world_matrix_continuous(camera_obj, Matrix.LocRotScale(loc, rot, cam_scale))
             return True
             
     except Exception as e:
@@ -2902,8 +3101,33 @@ class PINSOLVER_OT_add_pin(PinSolverBaseOperator):
             new_pin.pos_3d = context.scene.cursor.location
             
         set_pin_idx(cam_data, target_data, idx)
+        new_pin.id_data.update_tag()
         redraw_all_3d_views(context)
         return {'FINISHED'}
+
+def remove_pin_with_animation(pins, index):
+    owner = pins[index].id_data
+    prefix = pins[index].path_from_id()
+    removed = [(fc.data_path, fc.array_index, [k.co.x for k in fc.keyframe_points])
+               for fc in action_fcurves_for_datablock(owner)
+               if fc.data_path.startswith(prefix + '.')]
+    for path, channel, frames in removed:
+        for frame in frames:
+            owner.keyframe_delete(data_path=path, index=channel, frame=frame)
+    shifted = [(pins[i].path_from_id(), pins[i-1].path_from_id()) for i in range(index+1, len(pins))]
+    for curve in action_fcurves_for_datablock(owner):
+        for old, new in shifted:
+            if curve.data_path.startswith(old + '.'):
+                curve.data_path = new + curve.data_path[len(old):]
+                break
+    pins.remove(index)
+    owner.update_tag()
+
+
+def clear_pins_with_animation(pins):
+    for index in reversed(range(len(pins))):
+        remove_pin_with_animation(pins, index)
+
 
 class PINSOLVER_OT_remove_pin(PinSolverBaseOperator):
     bl_idname = "view3d.pinsolver_remove_pin"
@@ -2916,7 +3140,7 @@ class PINSOLVER_OT_remove_pin(PinSolverBaseOperator):
         if not target_data: return {'CANCELLED'}
         pins, active_idx = get_pins(cam_data, target_data)
         idx = self.index if self.index != -1 else active_idx
-        if 0 <= idx < len(pins): pins.remove(idx)
+        if 0 <= idx < len(pins): remove_pin_with_animation(pins, idx)
         set_pin_idx(cam_data, target_data, max(0, min(active_idx, len(pins) - 1)))
         update_reproj_errors(context, cam_data, target_data, force_update=True)
         redraw_all_3d_views(context)
@@ -2935,7 +3159,7 @@ class PINSOLVER_OT_clear_pins(PinSolverBaseOperator):
         cam_data, target_data, _ = get_active_target_data(context)
         if not target_data: return {'CANCELLED'}
         pins, _ = get_pins(cam_data, target_data)
-        pins.clear()
+        clear_pins_with_animation(pins)
         set_pin_idx(cam_data, target_data, 0)
         update_reproj_errors(context, cam_data, target_data, force_update=True)
         redraw_all_3d_views(context)
@@ -3180,8 +3404,8 @@ class PINSOLVER_OT_pin_from_cursor(PinSolverBaseOperator):
             return {'CANCELLED'}
         if self.to_2d:
             region, rv3d, _, _ = get_3d_region_context(context)
-            if cam_data.ui_mode != 'LAYOUT' or rv3d is None or rv3d.view_perspective != 'CAMERA':
-                self.report({'WARNING'}, "2D cursor projection requires Camera View in Layout mode")
+            if pins[index].is_track_linked or rv3d is None or rv3d.view_perspective != 'CAMERA':
+                self.report({'WARNING'}, "2D cursor projection requires a manual pin in Camera View")
                 return {'CANCELLED'}
             cursor = context.scene.cursor.location
             camera = get_camera_unscaled_matrix(context.scene.camera, context.evaluated_depsgraph_get())
@@ -3229,9 +3453,6 @@ class PINSOLVER_OT_auto_raycast_single(Operator):
         if active_idx < 0 or active_idx >= len(pins): return {'CANCELLED'}
         pin = pins[active_idx]
         
-        if cam_data.ui_mode == 'MATCHMOVE' and not pin.is_track_linked:
-            return {'CANCELLED'}
-            
         p2d = get_current_pin_pos_2d(context, cam_data, pin)
         if p2d is None: return {'CANCELLED'}
         
@@ -3310,7 +3531,7 @@ class PINSOLVER_OT_edit_pins(PinSolverBaseOperator):
             elif event.type == 'X' and cam_data.ui_mode == 'LAYOUT':
                 hover_idx, _ = get_closest_pin_item(context, cam_data, target_data, mouse_vec, region, rv3d)
                 if hover_idx != -1:
-                    pins.remove(hover_idx)
+                    remove_pin_with_animation(pins, hover_idx)
                     set_pin_idx(cam_data, target_data, max(0, min(active_idx, len(pins) - 1)))
                     update_reproj_errors(context, cam_data, target_data, force_update=True)
                     redraw_all_3d_views(context)
@@ -3400,8 +3621,10 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
     bl_options = {'REGISTER', 'UNDO'}
     dragging_idx: IntProperty(default=-1)
 
-    def _auto_key_tweak_result(self, context, cam_data, target_obj):
-        auto_key_solve_result(context, cam_data, context.scene.camera, target_obj, include_camera_data=(cam_data.ui_mode in {'LAYOUT', 'MATCHMOVE'}))
+    def _auto_key_tweak_result(self, context, cam_data, target_obj, create_transform_keys=False):
+        auto_key_solve_result(context, cam_data, context.scene.camera, target_obj,
+            include_camera_data=(cam_data.ui_mode in {'LAYOUT', 'MATCHMOVE'}),
+            create_transform_keys=(create_transform_keys and cam_data.ui_mode == 'LAYOUT'))
 
     def _sync_other_pins_2d(self, context, cam_data, target_data, region, rv3d, ignore_idx=-1):
         if cam_data.ui_mode != 'LAYOUT': return
@@ -3457,7 +3680,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                 applied = True
                 context.view_layer.update()
                 if is_dragging:
-                    self._auto_key_tweak_result(context, cam_data, target_obj)
+                    self._auto_key_tweak_result(context, cam_data, target_obj, create_transform_keys=True)
         update_reproj_errors(context, cam_data, target_data, force_update=True)
         context.area.tag_redraw()
         return applied
@@ -3472,7 +3695,11 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
             return {'PASS_THROUGH'}
 
         if event.type == 'TIMER':
-            if hasattr(self, '_needs_initial_sync') and self._needs_initial_sync:
+            frame_changed = getattr(self, '_sync_frame', context.scene.frame_current) != context.scene.frame_current
+            if frame_changed or getattr(self, '_needs_initial_sync', False):
+                self._sync_frame = context.scene.frame_current
+                if frame_changed:
+                    self.dragging_idx = -1
                 self._needs_initial_sync = False
                 region, rv3d, _, _ = get_3d_region_context(context, event, cross_window=False)
                 if region and rv3d:
@@ -3525,7 +3752,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
                 if hover_idx != -1:
                     if event.type == 'X':
                         if cam_data.ui_mode == 'LAYOUT':
-                            pins.remove(hover_idx)
+                            remove_pin_with_animation(pins, hover_idx)
                             set_pin_idx(cam_data, target_data, max(0, min(active_idx, len(pins) - 1)))
                             update_reproj_errors(context, cam_data, target_data, force_update=True)
                             redraw_all_3d_views(context)
@@ -3596,6 +3823,7 @@ class PINSOLVER_OT_tweak(PinSolverBaseOperator):
         region, rv3d, _, _ = get_3d_region_context(context, cross_window=False)
         
         self._needs_initial_sync = False
+        self._sync_frame = context.scene.frame_current
         if rv3d and rv3d.view_perspective != 'CAMERA':
             rv3d.view_perspective = 'CAMERA'
             self._needs_initial_sync = True
@@ -3637,7 +3865,7 @@ class PINSOLVER_OT_send_to_layout(Operator):
         cam_data, target_data, _ = get_active_target_data(context)
         if not target_data: return {'CANCELLED'}
         
-        target_data.layout_pins.clear()
+        clear_pins_with_animation(target_data.layout_pins)
         
         added = 0
         for p in target_data.mm_pins:
@@ -3695,8 +3923,8 @@ class PINSOLVER_OT_sync_trackers(Operator):
         
         removed_count = 0
         for i in range(len(pins) - 1, -1, -1):
-            if pins[i].track_name not in alive_track_names:
-                pins.remove(i)
+            if pins[i].is_track_linked and pins[i].track_name not in alive_track_names:
+                remove_pin_with_animation(pins, i)
                 removed_count += 1
                 
         existing_pins = {p.track_name: p for p in pins if p.is_track_linked}
@@ -3780,9 +4008,26 @@ class PINSOLVER_OT_set_reference_frame(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     def execute(self, context):
         cam_data = context.scene.camera.pinsolver_data
+        cam_data.use_reference_frame_lock = True
         cam_data.reference_frame = context.scene.frame_current
         self.report({'INFO'}, f"Reference Frame set to {cam_data.reference_frame}")
         return {'FINISHED'}
+
+class PINSOLVER_OT_set_sequence_bound(Operator):
+    bl_idname = "view3d.pinsolver_set_sequence_bound"
+    bl_label = "Set Range Boundary"
+    bl_description = "Set the selected Custom Range boundary to the current frame"
+    bl_options = {'REGISTER', 'UNDO'}
+    bound: EnumProperty(items=[('START', "In", "Set In"), ('END', "Out", "Set Out")])
+
+    def execute(self, context):
+        data = context.scene.camera.pinsolver_data
+        if self.bound == 'START':
+            data.bake_start = context.scene.frame_current
+        else:
+            data.bake_end = context.scene.frame_current
+        return {'FINISHED'}
+
 
 class PINSOLVER_OT_bake_animation(Operator):
     bl_idname = "view3d.pinsolver_bake_animation"
@@ -3792,9 +4037,12 @@ class PINSOLVER_OT_bake_animation(Operator):
     
     def execute(self, context):
         cam_data, target_data, target_obj = get_active_target_data(context)
-        if not target_data or not cam_data.target_clip: return {'CANCELLED'}
+        if not target_data or not cam_data.target_clip:
+            self.report({'WARNING'}, "Select a Movie Clip for sequence solving")
+            return {'CANCELLED'}
         
         clip = cam_data.target_clip
+        pins, _ = get_pins(cam_data, target_data)
         try:
             idx = int(cam_data.tracking_object_idx)
             tracks = clip.tracking.objects[idx].tracks
@@ -3802,21 +4050,29 @@ class PINSOLVER_OT_bake_animation(Operator):
             self.report({'WARNING'}, "Invalid Track Layer")
             return {'CANCELLED'}
                 
-        if not tracks: 
+        if not tracks:
             self.report({'WARNING'}, "No tracks found in the active tracking layer")
             return {'CANCELLED'}
         
+        range_start, range_end = get_sequence_frame_range(context, cam_data)
+        reference_frame = get_sequence_reference_frame(context, cam_data)
         bake_frames = []
         if cam_data.bake_target == 'MARKERS':
             mrks = context.scene.timeline_markers
             if not mrks:
                 self.report({'WARNING'}, "No Timeline Markers found")
                 return {'CANCELLED'}
-            bake_frames = sorted(list(set([m.frame for m in mrks])))
+            bake_frames = sorted({m.frame for m in mrks
+                if not cam_data.use_custom_range or range_start <= m.frame <= range_end})
         else:
-            bake_frames = list(range(context.scene.frame_start, context.scene.frame_end + 1))
+            bake_frames = list(range(range_start, range_end + 1))
             
-        if not bake_frames: return {'CANCELLED'}
+        if not bake_frames:
+            self.report({'WARNING'}, "No frames in the selected bake range")
+            return {'CANCELLED'}
+        if not min(bake_frames) <= reference_frame <= max(bake_frames):
+            self.report({'WARNING'}, "Reference Frame must be inside the bake range")
+            return {'CANCELLED'}
         orig_frame = context.scene.frame_current
         motion_source = getattr(cam_data, "sequence_motion_source", 'PNP')
         if motion_source == 'MARKER_REFS' and cam_data.bake_target != 'SCENE':
@@ -3830,12 +4086,12 @@ class PINSOLVER_OT_bake_animation(Operator):
         if use_marker_references:
             marker_reference_frames = {
                 m.frame for m in context.scene.timeline_markers
-                if context.scene.frame_start <= m.frame <= context.scene.frame_end
+                if range_start <= m.frame <= range_end
             }
             if not marker_reference_frames:
                 self.report({'WARNING'}, "Timeline Markers source requires markers inside the scene range")
                 return {'CANCELLED'}
-            marker_reference_frames.add(cam_data.reference_frame)
+            marker_reference_frames.add(reference_frame)
             for f in sorted(marker_reference_frames):
                 context.scene.frame_set(f)
                 context.view_layer.update()
@@ -3857,6 +4113,8 @@ class PINSOLVER_OT_bake_animation(Operator):
         valid_pin_count = sum(1 for p in pins if p.use_initial and p.has_valid_3d)
         min_sequence_pins = 2 if use_existing_location else 4
         if valid_pin_count < min_sequence_pins:
+            context.scene.frame_set(orig_frame)
+            context.view_layer.update()
             if use_existing_location:
                 self.report({'WARNING'}, "Existing Location requires 2+ valid pins for rotation solve")
             else:
@@ -3869,7 +4127,26 @@ class PINSOLVER_OT_bake_animation(Operator):
         
         cam_ref = context.scene.camera.data
         trk_cam = clip.tracking.camera
-        if cam_data.calib_animation_mode == 'ZOOM':
+        boundary_snapshots = []
+        if cam_data.use_custom_range:
+            key_target = get_solve_transform_target(cam_data, context.scene.camera, target_obj)
+            if key_target:
+                boundary_snapshots.extend(snapshot_range_boundaries(key_target,
+                    {"location", get_rotation_key_path(key_target)}, range_start, range_end))
+            data_paths = ({"lens"} if cam_data.calib_focal_length else set())
+            if cam_data.calib_optical_center:
+                data_paths.update({"shift_x", "shift_y"})
+            boundary_snapshots.extend(snapshot_range_boundaries(cam_ref, data_paths, range_start, range_end))
+        animated_lens = bool(keyed_fcurves_for_path(cam_ref, "lens"))
+        input_lens_by_frame = {}
+        if animated_lens:
+            for f in sorted(set(bake_frames) | {reference_frame}):
+                context.scene.frame_set(f)
+                context.view_layer.update()
+                input_lens_by_frame[f] = float(cam_ref.lens)
+        if cam_data.calib_animation_mode == 'ZOOM' or animated_lens:
+            context.scene.frame_set(reference_frame)
+            context.view_layer.update()
             sync_clip_camera_from_scene(context, cam_data)
         else:
             sync_scene_camera_from_clip(context, cam_data)
@@ -3878,7 +4155,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         # ----------------------------------------------------
         # Pass 1 - Ground Truth Calibration
         # ----------------------------------------------------
-        if needs_calib and cam_data.calib_animation_mode == 'STATIC' and cam_data.calib_static_method != 'CURRENT':
+        if needs_calib and not animated_lens and cam_data.calib_animation_mode == 'STATIC' and cam_data.calib_static_method != 'CURRENT':
             static_data = []
             for f in bake_frames:
                 context.scene.frame_set(f)
@@ -3897,22 +4174,27 @@ class PINSOLVER_OT_bake_animation(Operator):
                 base_lens, base_sx, base_sy = cam_ref.lens, cam_ref.shift_x, cam_ref.shift_y
                 base_k1, base_k2, base_k3 = trk_cam.k1, trk_cam.k2, trk_cam.k3
                 
-        elif cam_data.calib_animation_mode == 'ZOOM':
-            context.scene.frame_set(cam_data.reference_frame)
+        elif cam_data.calib_animation_mode == 'ZOOM' or animated_lens:
+            context.scene.frame_set(reference_frame)
             context.view_layer.update()
             base_lens = cam_ref.lens
             base_sx = cam_ref.shift_x
             base_sy = cam_ref.shift_y
             base_k1, base_k2, base_k3 = trk_cam.k1, trk_cam.k2, trk_cam.k3
         else: # CURRENT
-            context.scene.frame_set(cam_data.reference_frame)
+            context.scene.frame_set(reference_frame)
             success, _ = solve_camera_pose(context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=not needs_calib)
             base_lens = cam_ref.lens
             base_sx = cam_ref.shift_x
             base_sy = cam_ref.shift_y
             base_k1, base_k2, base_k3 = trk_cam.k1, trk_cam.k2, trk_cam.k3
         
-        if cam_data.calib_animation_mode == 'STATIC':
+        if animated_lens and cam_data.calib_focal_length:
+            # New neighboring lens keys must not change the reference's interpolated value.
+            cam_ref.lens = input_lens_by_frame[reference_frame]
+            cam_ref.keyframe_insert("lens", frame=reference_frame)
+
+        if cam_data.calib_animation_mode == 'STATIC' and not animated_lens:
             if cam_data.calib_focal_length:
                 apply_lens_to_scene_and_clip(context.scene.camera, clip, base_lens)
             else:
@@ -3924,7 +4206,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         res_x = max(1.0, context.scene.render.resolution_x * (context.scene.render.resolution_percentage / 100.0))
         res_y = max(1.0, context.scene.render.resolution_y * (context.scene.render.resolution_percentage / 100.0))
         
-        context.scene.frame_set(cam_data.reference_frame)
+        context.scene.frame_set(reference_frame)
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
         target_obj_eval = target_obj.evaluated_get(depsgraph) if target_obj else None
@@ -3937,16 +4219,17 @@ class PINSOLVER_OT_bake_animation(Operator):
             ref_key_obj = context.scene.camera.parent
             ref_parent_camera_local = capture_parent_camera_local_matrix(context, context.scene.camera)
         ref_key_matrix = ref_key_obj.matrix_world.copy() if ref_key_obj else None
+        ref_key_euler = ref_key_obj.rotation_euler.copy() if ref_key_obj else None
         
         # ----------------------------------------------------
         # Pass 2 - Chain Solving
         # ----------------------------------------------------
         success_count = 0
         insufficient_pin_frames = set()
-        frames_forward = [f for f in bake_frames if f >= cam_data.reference_frame]
-        frames_backward = sorted([f for f in bake_frames if f < cam_data.reference_frame], reverse=True)
+        frames_forward = [f for f in bake_frames if f >= reference_frame]
+        frames_backward = sorted([f for f in bake_frames if f < reference_frame], reverse=True)
         chain_pose = ref_result.copy()
-        chain_frame = cam_data.reference_frame
+        chain_frame = reference_frame
         chain_prev_pose = None
         chain_prev_frame = None
         chain_prev2_pose = None
@@ -3993,14 +4276,13 @@ class PINSOLVER_OT_bake_animation(Operator):
                 obj_to_key = context.scene.camera.parent
             if not obj_to_key:
                 return False
-            if f == cam_data.reference_frame and ref_key_matrix is not None:
-                obj_to_key.matrix_world = ref_key_matrix.copy()
+            if f == reference_frame and ref_key_matrix is not None:
+                set_world_matrix_continuous(obj_to_key, ref_key_matrix.copy())
+                if obj_to_key.rotation_mode not in {'QUATERNION', 'AXIS_ANGLE'}:
+                    obj_to_key.rotation_euler = ref_key_euler
                 context.view_layer.update()
             obj_to_key.keyframe_insert(data_path="location", frame=f)
-            if obj_to_key.rotation_mode == 'QUATERNION':
-                obj_to_key.keyframe_insert(data_path="rotation_quaternion", frame=f)
-            else:
-                obj_to_key.keyframe_insert(data_path="rotation_euler", frame=f)
+            obj_to_key.keyframe_insert(data_path=get_rotation_key_path(obj_to_key), frame=f)
             return True
             
         def raycast_new_active_tracks_after_solve():
@@ -4029,7 +4311,7 @@ class PINSOLVER_OT_bake_animation(Operator):
                 pin.pos_3d = loc
                 pin.has_valid_3d = True
                 raycast_frame = context.scene.frame_current
-                raycast_direction = 1 if raycast_frame >= cam_data.reference_frame else -1
+                raycast_direction = 1 if raycast_frame >= reference_frame else -1
                 set_pin_3d_provenance(pin, True, raycast_frame, raycast_direction)
                 ref_3d_pos[pin.name] = Vector(loc)
                 ref_local_pos[pin.name] = tgt_inv @ Vector(loc)
@@ -4037,9 +4319,10 @@ class PINSOLVER_OT_bake_animation(Operator):
 
         def process_frame(f):
             nonlocal success_count, chain_pose, chain_frame, chain_prev_pose, chain_prev_frame, chain_prev2_pose, chain_prev2_frame
+            nonlocal chain_lens
             context.scene.frame_set(f)
             context.view_layer.update()
-            if f != cam_data.reference_frame and count_active_pose_pins(context, cam_data, target_data) < min_sequence_pins:
+            if f != reference_frame and count_active_pose_pins(context, cam_data, target_data) < min_sequence_pins:
                 insufficient_pin_frames.add(f)
             
             depsgraph = context.evaluated_depsgraph_get()
@@ -4051,16 +4334,20 @@ class PINSOLVER_OT_bake_animation(Operator):
                 else:
                     p.pos_3d = ref_3d_pos[p.name]
                 
-            if needs_calib and cam_data.calib_animation_mode == 'ZOOM':
+            if needs_calib and (cam_data.calib_animation_mode == 'ZOOM' or animated_lens):
+                static_zoom_frame = cam_data.calib_animation_mode == 'ZOOM' and not cam_data.use_dynamic_zoom
+                hold_static_lens = static_zoom_frame and cam_data.calib_focal_length
+                frame_lens = chain_lens if hold_static_lens else input_lens_by_frame.get(f, base_lens)
                 if cam_data.calib_focal_length:
-                    apply_lens_to_scene_and_clip(context.scene.camera, clip, base_lens)
+                    apply_lens_to_scene_and_clip(context.scene.camera, clip, frame_lens)
                 else:
-                    cam_ref.lens = base_lens
+                    cam_ref.lens = frame_lens
                 cam_ref.shift_x = base_sx
                 cam_ref.shift_y = base_sy
                 trk_cam.k1, trk_cam.k2, trk_cam.k3 = base_k1, base_k2, base_k3
                 
-                if cam_data.use_dynamic_zoom and f != cam_data.reference_frame:
+                calibration_succeeded = False
+                if not static_zoom_frame and (cam_data.use_dynamic_zoom or animated_lens) and f != reference_frame:
                     valid_pins = []
                     valid_p2ds = []
                     for p in pins:
@@ -4071,26 +4358,19 @@ class PINSOLVER_OT_bake_animation(Operator):
                                 valid_p2ds.append(p2d)
                                 
                     if len(valid_pins) >= PinSolverConfig.MIN_PINS_FOR_CALIBRATION:
-                        sw = cam_ref.sensor_height * (res_x / res_y) if cam_ref.sensor_fit == 'VERTICAL' or (cam_ref.sensor_fit == 'AUTO' and res_x < res_y) else cam_ref.sensor_width
-                        sh = cam_ref.sensor_height if cam_ref.sensor_fit == 'VERTICAL' or (cam_ref.sensor_fit == 'AUTO' and res_x < res_y) else cam_ref.sensor_width * (res_y / res_x)
-                        fx = (base_lens / max(1e-4, sw)) * res_x
-                        fy = (base_lens / max(1e-4, sh)) * res_y
-                        cx = res_x / 2.0 + (base_sx * max(res_x, res_y))
-                        cy = res_y / 2.0 - (base_sy * max(res_x, res_y))
-                        
-                        z_intr = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-                        z_dist = np.array([base_k1, base_k2, 0, 0, base_k3], dtype=np.float64)
+                        z_intr, z_dist, zoom_width, zoom_height = get_cv_camera_params(context, cam_data)
                         
                         camintr_new, _, _, _, succ, _ = _calibrate_lens(
-                            cam_data, valid_p2ds, valid_pins, res_x, res_y, z_intr, z_dist, 'initial', context.scene.camera, apply_to_blender=False, zoom_base_intrinsics=z_intr, zoom_base_distcoef=z_dist
+                            cam_data, valid_p2ds, valid_pins, zoom_width, zoom_height, z_intr, z_dist, 'initial', context.scene.camera, apply_to_blender=False, zoom_base_intrinsics=z_intr, zoom_base_distcoef=z_dist
                         )
                         
                         if succ:
-                            new_lens = float(camintr_new[0, 0]) * max(1e-4, sw) / res_x
+                            calibration_succeeded = True
+                            new_lens = frame_lens * float(camintr_new[0, 0]) / max(1e-8, z_intr[0, 0])
                             new_cx = float(camintr_new[0, 2])
                             new_cy = float(camintr_new[1, 2])
-                            new_sx = (new_cx - res_x / 2.0) / max(res_x, res_y)
-                            new_sy = (res_y / 2.0 - new_cy) / max(res_x, res_y)
+                            new_sx = (new_cx - zoom_width / 2.0) / max(zoom_width, zoom_height)
+                            new_sy = (zoom_height / 2.0 - new_cy) / max(zoom_width, zoom_height)
                             
                             if cam_data.calib_focal_length:
                                 apply_lens_to_scene_and_clip(context.scene.camera, clip, new_lens)
@@ -4098,12 +4378,15 @@ class PINSOLVER_OT_bake_animation(Operator):
                                 cam_ref.shift_x = new_sx
                                 cam_ref.shift_y = new_sy
                 
-                if cam_data.calib_focal_length: cam_ref.keyframe_insert("lens", frame=f)
+                if cam_data.calib_focal_length and f != reference_frame and (calibration_succeeded or hold_static_lens or not animated_lens):
+                    cam_ref.keyframe_insert("lens", frame=f)
                 if cam_data.calib_optical_center:
                     cam_ref.keyframe_insert("shift_x", frame=f)
                     cam_ref.keyframe_insert("shift_y", frame=f)
 
-            if f == cam_data.reference_frame:
+            chain_lens = float(cam_ref.lens)
+
+            if f == reference_frame:
                 chain_pose = ref_result.copy()
                 chain_frame = f
                 chain_prev_pose = None
@@ -4275,33 +4558,35 @@ class PINSOLVER_OT_bake_animation(Operator):
                         success_count += 1
                     raycast_new_active_tracks_after_solve()
 
-        context.scene.frame_set(cam_data.reference_frame)
+        context.scene.frame_set(reference_frame)
         apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result, ref_parent_camera_local)
         context.view_layer.update()
         chain_pose = ref_result.copy()
-        chain_frame = cam_data.reference_frame
+        chain_frame = reference_frame
         chain_prev_pose = None
         chain_prev_frame = None
         chain_prev2_pose = None
         chain_prev2_frame = None
+        chain_lens = float(base_lens)
         for f in frames_forward:
             process_frame(f)
             
-        context.scene.frame_set(cam_data.reference_frame)
+        context.scene.frame_set(reference_frame)
         apply_solve_result(context, cam_data, target_data, context.scene.camera, target_obj, ref_result, ref_parent_camera_local)
         context.view_layer.update()
         chain_pose = ref_result.copy()
-        chain_frame = cam_data.reference_frame
+        chain_frame = reference_frame
         chain_prev_pose = None
         chain_prev_frame = None
         chain_prev2_pose = None
         chain_prev2_frame = None
+        chain_lens = float(base_lens)
         for f in frames_backward:
             process_frame(f)
             
         marker_anchor_frames = set(marker_reference_frames) if use_marker_references else set()
-        marker_anchor_frames.add(cam_data.reference_frame)
-        fixed_reference_frames = set(marker_anchor_frames) if use_marker_references else {cam_data.reference_frame}
+        marker_anchor_frames.add(reference_frame)
+        fixed_reference_frames = set(marker_anchor_frames) if use_marker_references else {reference_frame}
 
         if use_candidate_path and len(solved_pose_by_frame) >= 2:
             low_quality_frames = find_low_quality_sequence_frames(
@@ -4687,7 +4972,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         roll_smoothed_pose_by_frame = stabilize_roll_pose_path(
             solved_pose_by_frame,
             getattr(cam_data, "sequence_roll_smoothing", 'OFF'),
-            cam_data.reference_frame,
+            reference_frame,
             getattr(cam_data, "sequence_roll_smoothing_strength", 1.0),
             fixed_reference_frames
         )
@@ -4738,6 +5023,11 @@ class PINSOLVER_OT_bake_animation(Operator):
             else:
                 p.reproj_error = -1.0
 
+        make_baked_euler_continuous(ref_key_obj, solved_pose_by_frame.keys(), reference_frame, ref_key_euler)
+        restore_range_boundaries(boundary_snapshots, range_start, range_end)
+        if cam_data.calib_animation_mode == 'ZOOM':
+            # Per-frame calibration is temporary; the Clip retains the reference lens.
+            trk_cam.focal_length = float(base_lens)
         context.scene.frame_set(orig_frame)
         context.view_layer.update()
         depsgraph = context.evaluated_depsgraph_get()
@@ -4764,6 +5054,9 @@ class PINSOLVER_OT_bake_animation(Operator):
         if missing_frames:
             warning_parts.append(f"Unsolved: {len(missing_frames)} frames (first {missing_frames[0]}, last {missing_frames[-1]}); existing keys/interpolation remain")
         warning_msg = " | " + " | ".join(warning_parts) if warning_parts else ""
+        if success_count > 0 and not cam_data.use_reference_frame_lock:
+            cam_data.use_reference_frame_lock = True
+            cam_data.reference_frame = reference_frame
         self.report({'WARNING'} if warning_parts else {'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + reraycast_msg + refine_msg + solver_msg + warning_msg)
         return {'FINISHED'}
 
@@ -6395,7 +6688,7 @@ class PINSOLVER_PT_panel(Panel):
                         box.label(text=f"{pin.name}{err_str}", icon=err_icon if pin.reproj_error >= 0 else 'LAYER_ACTIVE')
                     else:
                         err_str = f" | Max Err: {pin.reproj_error:.2f}px" if pin.reproj_error >= 0 and not cam_data.is_tweak_mode else ""
-                        box.label(text=f"Track: {pin.track_name}{err_str}", icon='TRACKING')
+                        box.label(text=f"{pin.track_name if pin.is_track_linked else pin.name}{err_str}", icon='TRACKING' if pin.is_track_linked else 'KEY_HLT')
 
                 box.prop(pin, "weight")
 
@@ -6479,13 +6772,28 @@ class PINSOLVER_PT_panel(Panel):
                 col_bake = layout.column(align=True)
                 
                 col_bake.row(align=True).prop(cam_data, "bake_target", expand=True)
+                custom_row = col_bake.row(align=True)
+                custom_row.prop(cam_data, "use_custom_range")
+                if cam_data.use_custom_range:
+                    custom_row.prop(cam_data, "custom_range_use_preview", text="", icon='PREVIEW_RANGE', toggle=True)
+                    range_row = col_bake.row(align=True)
+                    range_row.operator("view3d.pinsolver_set_sequence_bound", text="", icon='TRIA_LEFT_BAR').bound = 'START'
+                    range_row.prop(cam_data, "bake_start", text="In")
+                    range_row.prop(cam_data, "bake_end", text="Out")
+                    range_row.operator("view3d.pinsolver_set_sequence_bound", text="", icon='TRIA_RIGHT_BAR').bound = 'END'
                 if cam_data.bake_target == 'SCENE':
-                    col_bake.label(text=f"Range: Frame {context.scene.frame_start} to {context.scene.frame_end}")
+                    start, end = get_sequence_frame_range(context, cam_data)
+                    col_bake.label(text=f"Range: Frame {start} to {end}")
                 else:
                     col_bake.label(text="Range: Timeline Markers")
                     
                 ref_row = col_bake.row(align=True)
-                ref_row.prop(cam_data, "reference_frame")
+                if cam_data.use_reference_frame_lock:
+                    ref_row.prop(cam_data, "reference_frame")
+                else:
+                    ref_row.label(text=f"Reference Frame: {get_sequence_reference_frame(context, cam_data)}")
+                ref_row.prop(cam_data, "use_reference_frame_lock", text="",
+                    icon='LOCKED' if cam_data.use_reference_frame_lock else 'UNLOCKED', emboss=False)
                 ref_row.operator("view3d.pinsolver_set_reference_frame", text="", icon='TIME')
                 
                 opt_row = col_bake.row(align=True)
@@ -6911,7 +7219,7 @@ classes = (
     PINSOLVER_OT_pick_2d, PINSOLVER_OT_pick_3d, PINSOLVER_OT_pin_from_cursor, PINSOLVER_OT_auto_raycast_single, PINSOLVER_OT_sync_clip, PINSOLVER_OT_clear_pins,
     PINSOLVER_OT_add_pin, PINSOLVER_OT_remove_pin, PINSOLVER_OT_solve, 
     PINSOLVER_OT_edit_pins, PINSOLVER_OT_tweak, PINSOLVER_PT_panel,
-    PINSOLVER_OT_send_to_layout, PINSOLVER_OT_sync_trackers, PINSOLVER_OT_auto_raycast, PINSOLVER_OT_set_reference_frame,
+    PINSOLVER_OT_send_to_layout, PINSOLVER_OT_sync_trackers, PINSOLVER_OT_auto_raycast, PINSOLVER_OT_set_reference_frame, PINSOLVER_OT_set_sequence_bound,
     PINSOLVER_OT_bake_animation,
     PINSOLVER_OT_icp_add_pin, PINSOLVER_OT_icp_continuous_pins, PINSOLVER_OT_icp_remove_pin, PINSOLVER_OT_icp_clear_pins, PINSOLVER_OT_icp_pick_pin_point,
     PINSOLVER_OT_icp_preview_pin_alignment,
