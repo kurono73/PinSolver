@@ -123,9 +123,9 @@ Enable **Custom Range** to limit baking to **In / Out** and preserve existing ke
 
 ### Pin Align (3D Model Alignment)
 1. In the 3D Viewport sidebar, open the **PinSolver > Pin Align** panel.
-2. Set the mesh to move as **Source** and the reference mesh as **Target**. With two meshes selected, the selection button assigns the active mesh as Target.
-3. Add at least three **Alignment Pins**. Pick matching points on both meshes; Source and Target points can be picked in either order.
-4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the meshes need a uniform scale adjustment.
+2. Set the mesh or point-cloud object to move as **Source** and the reference mesh or point-cloud object as **Target**. With two supported objects selected, the selection button assigns the active object as Target.
+3. Add at least three **Alignment Pins**. Pick matching points on both objects; Source and Target points can be picked in either order.
+4. Use **Preview Pins** to validate the rough alignment. Enable **Pin Scale** only when the objects need a uniform scale adjustment.
 5. Use **Preview ICP** to refine the Source against the Target. Set a **Source Mask** when only part of the Source should contribute to the match.
 6. Click **Apply** to keep the previewed transform, or **Revert** to restore the Source transform.
 
@@ -134,7 +134,7 @@ Enable **Custom Range** to limit baking to **In / Out** and preserve existing ke
 ## Q&A / Troubleshooting
 
 **Q: Pressing 'A' in the Interactive Pin Editor or Tweak mode doesn't add a pin.**  
-**A:** To add a pin, there must be a 3D model (mesh) directly under your cursor along the camera's line of sight. Pins cannot be raycasted into empty space (e.g., just the background image). Ensure your cursor is hovering over a 3D surface before pressing 'A'.
+**A:** In Layout mode, adding a pin with 'A' requires a pickable mesh surface under the cursor or visible, drawable point-cloud geometry within the pick circle. Supported point geometry includes native point clouds, Geometry Nodes point output, and vertex-only meshes rendered as points. For vertex-only meshes, use **Mesh to Points** when needed. Pins cannot be placed in empty space (e.g., just the background image). See **Point Cloud Picking** above for depth-picking requirements and limitations.
 
 **Q: The alignment doesn't match up correctly when I click `Solve Alignment`.**  
 **A:** There are several potential causes for this issue:
@@ -151,3 +151,4 @@ Enable **Custom Range** to limit baking to **In / Out** and preserve existing ke
 
 ## License
 CV PinSolver is GPL-3.0-or-later. OpenCV is Apache-2.0 licensed.
+
