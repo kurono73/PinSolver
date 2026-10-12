@@ -23,18 +23,6 @@ PinSolver includes two distinct modes depending on your objective:
 ### 📐 Pin Align
 * Aligns Source and Target meshes or point clouds from matching 3D pin pairs, with optional ICP refinement.
 
-### Point Cloud Picking
-* Geometry detection recognizes native point clouds, Geometry Nodes point output, and vertex-only meshes. Depth picking requires visible, drawable point geometry; use Mesh to Points for vertex-only data when needed. ICP registration can still sample raw vertex-only meshes.
-* Normal picking estimates a local surface from displayed points and intersects it with the center ray. With too few points to estimate a normal, a view-facing patch at the sampled depth is used as an approximation. Empty circles remain misses; noisy point clouds can still reduce Matchmove accuracy.
-* Point-cloud picking displays a screen-space circle automatically. Wheel Up / `-` shrinks it; Wheel Down / `+` enlarges it. The size is remembered, and pick shortcuts appear in the status bar. Hover only updates the guide.
-* All point-cloud picking uses depth images without a point-cloud spatial index. Main **Pick 3D** reads the visible viewport; Interactive Pin Editor and Pin Align use offscreen depth. Source and Target are isolated temporarily for identification, with visibility restored immediately. Only samples inside the pick circle contribute to the surface fit.
-* Hold **Alt** to snap to a mesh vertex or the approximate center of an isolated displayed cloud point. Merged or clipped point blobs fall back to the nearest sample. **Always Snap to Vertex** enables snapping persistently; shared options are also available in Pin Align's **Advanced** section.
-* Matchmove renders depth using the solved camera pose and intrinsics, independently of viewport orientation. Matching depth images are reused across trackers. Offscreen depth uses Solid shading at up to 2048 pixels on the longer side and requires a Blender window with a 3D View and GPU context. Mesh raycasts and mesh vertex snapping are unchanged. ICP registration itself continues to use 3D geometry, not screen pixels.
-* In Matchmove, **Track Radius (%)** uses a percentage of the image's shorter side, independently of viewport zoom. **Show Track Circles** toggles tracker radius guides in Camera View.
-* Pin Align uses one Pick button per pair: the clicked Source or Target is detected automatically. Missing pairs continue to the other side; completed pairs update only the clicked side.
-* In Layout mode, the cursor icon beside **Pick 3D** copies the 3D Cursor position. Beside **Pick 2D**, it projects the cursor into the camera image and is available only in Camera View. The cursor toggle beside the pin list initializes new list-added 3D pins at the cursor.
-* ICP can align point clouds without precomputed normals. Face masks do not apply to point clouds; selected-vertex and vertex-group masks remain available for vertex-only meshes. For mixed evaluated geometry containing faces and points, ICP uses the mesh surface.
-
 ### 🎯 Core PnP Solver
 * **1-Pin (Raycast):** Instantly snaps the target along the camera's ray (line of sight) using a single point.
 * **2-Pin (Pan/Orbit):** Calculates basic orientation and translation using two points.
