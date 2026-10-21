@@ -6713,8 +6713,9 @@ class PINSOLVER_PT_panel(Panel):
                     cd = box.column(align=True)
                     r3 = cd.row(align=True)
                     r3.label(text="3D(■):")
-                    op3d = r3.operator("view3d.pinsolver_pick_3d", text="Pick", icon='EYEDROPPER', depress=(target_data.picking_state=='PICK_3D'))
+                    op3d = r3.operator("view3d.pinsolver_pick_3d", text="", icon='EYEDROPPER', depress=(target_data.picking_state=='PICK_3D'))
                     op3d.target_index = active_idx
+                    r3.operator("view3d.pinsolver_pin_from_cursor", text="", icon='CURSOR').to_2d = False
                     r3.operator("view3d.pinsolver_auto_raycast_single", text="Raycast", icon='CON_TRACKTO')
 
                 r_coords = box.row(align=True)
