@@ -19,6 +19,7 @@ from dataclasses import replace
 from typing import Tuple, Optional, Any, List, Dict, Set
 from . import pointcloud
 from . import depth_pick
+from . import mesh_snap
 
 from .icp.geometry import extract_world_triangles, object_fingerprint, sample_surface_points_with_normals
 from .icp.cancel import IcpCancelled
@@ -590,23 +591,7 @@ def safe_ray_cast(context: bpy.types.Context, origin: Vector, direction: Vector,
             if distance < (loc-ray_origin).dot(direction)-max(1e-5, abs(distance)*.0001):
                 return True, depth_point
         if snap_to_vertex and obj and obj.type == 'MESH':
-            try:
-                eval_obj = obj.evaluated_get(depsgraph)
-                mesh = eval_obj.data
-                if mesh and hasattr(mesh, "polygons") and index < len(mesh.polygons):
-                    face = mesh.polygons[index]
-                    closest_v_loc = None
-                    min_dist = float('inf')
-                    for v_idx in face.vertices:
-                        v_world = matrix @ mesh.vertices[v_idx].co
-                        dist = (v_world - loc).length
-                        if dist < min_dist:
-                            min_dist = dist
-                            closest_v_loc = v_world
-                    if closest_v_loc:
-                        loc = closest_v_loc
-            except Exception:
-                pass
+            loc = mesh_snap.snap_vertex(obj, depsgraph, matrix, index, loc, cur_origin, direction)
                 
         return True, loc
     return False, None
@@ -5344,27 +5329,10 @@ def is_raycast_object_match(hit_obj, target_obj) -> bool:
         return False
     return hit_obj == target_obj or getattr(hit_obj, "original", None) == target_obj or hit_obj.name == target_obj.name
 
-def snap_icp_raycast_location(obj, depsgraph, matrix: Matrix, face_index: int, loc: Vector, snap_to_vertex: bool) -> Vector:
+def snap_icp_raycast_location(obj, depsgraph, matrix: Matrix, face_index: int, loc: Vector, snap_to_vertex: bool, origin=None, direction=None) -> Vector:
     if not snap_to_vertex or not obj or obj.type != 'MESH':
         return loc
-    try:
-        eval_obj = obj.evaluated_get(depsgraph)
-        mesh = eval_obj.data
-        if mesh and hasattr(mesh, "polygons") and 0 <= face_index < len(mesh.polygons):
-            face = mesh.polygons[face_index]
-            closest_v_loc = None
-            min_dist = float('inf')
-            for v_idx in face.vertices:
-                v_world = matrix @ mesh.vertices[v_idx].co
-                dist = (v_world - loc).length
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_v_loc = v_world
-            if closest_v_loc:
-                return closest_v_loc
-    except Exception:
-        pass
-    return loc
+    return mesh_snap.snap_vertex(obj, depsgraph, matrix, face_index, loc, origin, direction)
 
 def raycast_icp_visible_pin_point(context: bpy.types.Context, source_obj: bpy.types.Object, target_obj: bpy.types.Object, origin: Vector, direction: Vector, snap_to_vertex: bool = False, depth_view=None) -> Tuple[bool, Optional[str], Optional[bpy.types.Object], Optional[Vector]]:
     scene = context.scene
@@ -5395,9 +5363,9 @@ def raycast_icp_visible_pin_point(context: bpy.types.Context, source_obj: bpy.ty
         if point_hit and point_hit[2] < (loc-origin).dot(direction)-PinSolverConfig.RAYCAST_START_OFFSET-max(1e-5, abs(point_hit[2])*.0001):
             return point_result()
         if is_raycast_object_match(obj, source_obj):
-            return True, 'SOURCE', source_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex)
+            return True, 'SOURCE', source_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex, cur_origin, direction)
         if is_raycast_object_match(obj, target_obj):
-            return True, 'TARGET', target_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex)
+            return True, 'TARGET', target_obj, snap_icp_raycast_location(obj, depsgraph, matrix, index, loc, snap_to_vertex, cur_origin, direction)
         cur_origin = loc + direction * 0.01
     return point_result()
 
@@ -7182,6 +7150,9 @@ class PinSolverAddon:
         bpy.app.handlers.load_pre.append(depth_pick.invalidate)
         bpy.app.handlers.undo_post.append(depth_pick.invalidate)
         bpy.app.handlers.redo_post.append(depth_pick.invalidate)
+        for handlers in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_pre,
+                bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
+            handlers.append(mesh_snap.invalidate)
         for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre, bpy.app.handlers.load_pre):
             if clear_pick_radius_overlay not in handlers:
                 handlers.append(clear_pick_radius_overlay)
@@ -7195,6 +7166,9 @@ class PinSolverAddon:
                 bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
             if depth_pick.invalidate in handlers:
                 handlers.remove(depth_pick.invalidate)
+            if mesh_snap.invalidate in handlers:
+                handlers.remove(mesh_snap.invalidate)
+        mesh_snap.invalidate()
         depth_pick.release()
         for handlers in (bpy.app.handlers.undo_pre, bpy.app.handlers.redo_pre, bpy.app.handlers.load_pre):
             if clear_pick_radius_overlay in handlers:
