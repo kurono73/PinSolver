@@ -3097,8 +3097,10 @@ def remove_pin_with_animation(pins, index):
                for fc in action_fcurves_for_datablock(owner)
                if fc.data_path.startswith(prefix + '.')]
     for path, channel, frames in removed:
+        property_name = path[len(prefix) + 1:]
+        delete_index = channel if pins[index].bl_rna.properties[property_name].is_array else -1
         for frame in frames:
-            owner.keyframe_delete(data_path=path, index=channel, frame=frame)
+            owner.keyframe_delete(data_path=path, index=delete_index, frame=frame)
     shifted = [(pins[i].path_from_id(), pins[i-1].path_from_id()) for i in range(index+1, len(pins))]
     for curve in action_fcurves_for_datablock(owner):
         for old, new in shifted:
