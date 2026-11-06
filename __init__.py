@@ -20,6 +20,10 @@ from typing import Tuple, Optional, Any, List, Dict, Set
 from . import pointcloud
 from . import depth_pick
 from . import mesh_snap
+from . import track_selection
+from .zoom_refine import refine_zoom_intrinsics
+from . import reprojection
+from .window_refine import refine_camera_path
 
 from .icp.geometry import extract_world_triangles, object_fingerprint, sample_surface_points_with_normals
 from .icp.cancel import IcpCancelled
@@ -59,6 +63,18 @@ class UIStrings:
 # ==========================================
 # 0. Utilities & Pure OpenCV Native Math
 # ==========================================
+_sequence_refine_owner = None
+
+
+def use_matchmove_refinement(cam_data):
+    return (_sequence_refine_owner is not None and cam_data.as_pointer() == _sequence_refine_owner and
+            cam_data.ui_mode == 'MATCHMOVE' and
+            cam_data.solve_mode in {'CAMERA','PARENT'} and
+            getattr(cam_data, 'sequence_motion_source', 'PNP') != 'EXISTING' and
+            getattr(cam_data, 'sequence_stabilize_mode', 'OFF') != 'OFF' and
+            getattr(cam_data, 'sequence_location_filter_strength', 1.) > 1e-6)
+
+
 def redraw_all_3d_views(context: bpy.types.Context) -> None:
     for window in context.window_manager.windows:
         for area in window.screen.areas:
@@ -672,6 +688,8 @@ def set_pin_3d_provenance(pin: Any, auto_raycasted: bool, frame: int = -1, direc
 # 1. Data Structures & Settings
 # ==========================================
 class PinSolverSettings(PropertyGroup):
+    sync_track_selection: BoolProperty(name="Sync Track Selection", default=True,
+        description="Synchronize active Matchmove pins and Clip tracks while Show Pins is enabled; list clicks select one Clip track, Clip multi-selection is preserved when reading from Clip")
     force_vertex_snap: BoolProperty(name="Always Snap to Vertex", default=False,
         description="Snap to mesh vertices or the approximate center of displayed cloud points. Hold Alt for temporary snapping")
     cursor_new_pins: BoolProperty(name="Add Pins at 3D Cursor", default=False,
@@ -952,7 +970,8 @@ class PinSolverData(PropertyGroup):
     layout_pins: CollectionProperty(type=PinSolverPin)
     layout_pin_idx: IntProperty(default=0, description="Active Layout Pin - Select a pin to view or edit its coordinates")
     mm_pins: CollectionProperty(type=PinSolverPin)
-    mm_pin_idx: IntProperty(default=0, description="Active Matchmove Track - Select a tracked pin to view or edit its coordinates")
+    mm_pin_idx: IntProperty(default=0, update=track_selection.update_pin_index,
+        description="Active Matchmove Track - Select a tracked pin to view or edit its coordinates")
     
     reference_frame: IntProperty(name="Reference Frame", default=1, description="The frame where 3D Pins are perfectly aligned to the scene")
     use_reference_frame_lock: BoolProperty(name="Lock Reference Frame", default=True,
@@ -983,8 +1002,8 @@ class PinSolverData(PropertyGroup):
         name="Location Filter",
         items=[
             ('OFF', "Off", "Use direct PnP location and rotation without curve repair"),
-            ('AUTO', "Smooth", "Use guided PnP, repair location outliers, smooth location, then refit rotation"),
-            ('STRONG', "Hyper Smooth", "Use stronger location repair and smoothing for difficult tracker layouts")
+            ('AUTO', "Smooth", "Robust PnP, location smoothing, and 7-frame camera/zoom refinement"),
+            ('STRONG', "Hyper Smooth", "Stronger location smoothing and 15-frame camera/zoom refinement for difficult tracks")
         ],
         default='OFF'
     )
@@ -1326,7 +1345,7 @@ def _prep_multi_pin_data(valid_pins: List[Any], valid_p2ds: List[Vector], res_x:
     
     for p, p2d in zip(valid_pins, valid_p2ds):
         pixel_x, pixel_y = to_cv_pixel(p2d.x, p2d.y, res_x, res_y)
-        w_int = 1 + int(p.weight * 99)
+        w_int = reprojection.pin_importance(p.weight)
             
         for _ in range(w_int):
             solve_obj_pts.append(list(p.pos_3d))
@@ -1350,9 +1369,25 @@ def _prep_multi_pin_data(valid_pins: List[Any], valid_p2ds: List[Vector], res_x:
     
     return obj_pts, img_pts, rvec_guess, tvec_guess
 
-def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[Any], res_x: float, res_y: float, camintr: np.ndarray, distcoef: np.ndarray, target_mode: str, camera_obj: bpy.types.Object, apply_to_blender: bool = True, zoom_base_intrinsics: np.ndarray = None, zoom_base_distcoef: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, str]:
+def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[Any], res_x: float, res_y: float, camintr: np.ndarray, distcoef: np.ndarray, target_mode: str, camera_obj: bpy.types.Object, apply_to_blender: bool = True, zoom_base_intrinsics: np.ndarray = None, zoom_base_distcoef: np.ndarray = None, initial_pose_matrix: Optional[Matrix] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, bool, str]:
     if len(valid_pins) < PinSolverConfig.MIN_PINS_FOR_CALIBRATION:
         return camintr, distcoef, None, None, False, f"Calib Skipped: Need {PinSolverConfig.MIN_PINS_FOR_CALIBRATION}+ points"
+
+    if initial_pose_matrix is not None and zoom_base_intrinsics is not None and not apply_to_blender:
+        rotation = np.diag((1.0, -1.0, -1.0)) @ np.asarray(initial_pose_matrix.to_3x3().transposed())
+        rvec = cv2.Rodrigues(rotation)[0]
+        tvec = -rotation @ np.asarray(initial_pose_matrix.translation)
+        try:
+            matrix, rvec, tvec = refine_zoom_intrinsics(
+                [tuple(p.pos_3d) for p in valid_pins],
+                [(p.x*res_x, (1-p.y)*res_y) for p in valid_p2ds],
+                zoom_base_intrinsics, zoom_base_distcoef, rvec, tvec,
+                cam_data.calib_focal_length, cam_data.calib_optical_center,
+                point_weights=[reprojection.pin_importance(p.weight) for p in valid_pins],
+                robust_scale=reprojection.pixel_scale(res_x,res_y) if use_matchmove_refinement(cam_data) else None)
+            return matrix, zoom_base_distcoef.copy(), rvec, tvec, True, ""
+        except (cv2.error, ValueError, np.linalg.LinAlgError):
+            return camintr, distcoef, None, None, False, "Zoom calibration could not refine the previous pose"
 
     flags = cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_ASPECT_RATIO
     
@@ -2106,6 +2141,8 @@ def refine_rotation_for_fixed_location(
 ) -> Matrix:
     if base_pose is None:
         return base_pose
+    if use_matchmove_refinement(cam_data) and HAS_OPENCV:
+        return refine_matchmove_pose(context,cam_data,target_data,base_pose,True,pin_name_filter)
         
     pins, _ = get_pins(cam_data, target_data)
     world_dirs = []
@@ -2271,6 +2308,40 @@ def get_sequence_refine_pin_names(pins: Any, frame: int) -> Set[str]:
             eligible.add(pin.name)
     return eligible
 
+def refine_matchmove_pose(context, cam_data, target_data, pose, fixed_center=False, pin_names=None):
+    pins,_ = get_pins(cam_data,target_data)
+    eligible = get_sequence_refine_pin_names(pins,context.scene.frame_current)
+    intrinsics,distortion,width,height = get_cv_camera_params(context,cam_data)
+    points,pixels,weights = [],[],[]
+    for pin in pins:
+        if not pin.use_initial or not pin.has_valid_3d or pin.name not in eligible:
+            continue
+        if pin_names is not None and pin.name not in pin_names:
+            continue
+        uv = get_current_pin_pos_2d(context,cam_data,pin)
+        if uv is None:
+            continue
+        points.append(tuple(pin.pos_3d))
+        pixels.append(to_cv_pixel(uv.x,uv.y,width,height))
+        weights.append(reprojection.pin_importance(pin.weight))
+    if len(points)<(2 if fixed_center else 4):
+        return pose
+    rotation = np.diag((1.,-1.,-1.)) @ np.asarray(pose.to_3x3().transposed())
+    rvec = cv2.Rodrigues(rotation)[0]
+    tvec = -rotation @ np.asarray(pose.translation)
+    try:
+        rvec,tvec = reprojection.refine_pose(points,pixels,intrinsics,distortion,rvec,tvec,
+            weights,reprojection.pixel_scale(width,height),fixed_center)
+        candidate = opencv_pose_to_blender_matrix(rvec,tvec)
+        if candidate is None:
+            return pose
+        if fixed_center:
+            candidate.translation = pose.translation
+        return candidate
+    except (cv2.error,ValueError,np.linalg.LinAlgError):
+        return pose
+
+
 def pose_reprojection_error(
     context: bpy.types.Context,
     cam_data: Any,
@@ -2284,6 +2355,7 @@ def pose_reprojection_error(
     pins, _ = get_pins(cam_data, target_data)
     obj_pts = []
     img_pts = []
+    weights = []
     camintr, distcoef, res_x, res_y = get_cv_camera_params(context, cam_data)
     for pin in pins:
         if not pin.use_initial or not pin.has_valid_3d:
@@ -2295,6 +2367,7 @@ def pose_reprojection_error(
             continue
         obj_pts.append(list(Vector(pin.pos_3d)))
         img_pts.append(to_cv_pixel(p2d.x, p2d.y, res_x, res_y))
+        weights.append(reprojection.pin_importance(pin.weight))
         
     if not obj_pts:
         return float("inf")
@@ -2306,6 +2379,9 @@ def pose_reprojection_error(
         rvec, _ = cv2.Rodrigues(R_world2cv)
         tvec = -R_world2cv @ np.array(pose.translation, dtype=np.float64)
         proj_pts, _ = cv2.projectPoints(np.array(obj_pts, dtype=np.float64), rvec, tvec.reshape(3, 1), camintr, distcoef)
+        if use_matchmove_refinement(cam_data):
+            return reprojection.robust_score(proj_pts.reshape(-1,2)-np.asarray(img_pts),
+                np.asarray(weights),reprojection.pixel_scale(res_x,res_y))
         errors = []
         for proj, img in zip(proj_pts.reshape(-1, 2), img_pts):
             errors.append(float(np.linalg.norm(proj - np.array(img, dtype=np.float64))))
@@ -2804,6 +2880,8 @@ def solve_camera_pose(context: bpy.types.Context, cam_data: Any, target_data: An
                 target_data.last_error = err_msg
 
         success, mat, err = _estimate_pose(obj_pts, img_pts, camintr, distcoef, rvec_guess, tvec_guess, use_guess, fallback_rvec, fallback_tvec, use_planar=cam_data.use_planar_solve, allow_global_fallback=allow_global_fallback)
+        if success and mat is not None and use_matchmove_refinement(cam_data):
+            mat = refine_matchmove_pose(context,cam_data,target_data,mat,pin_names=pin_name_filter)
         if not success and not target_data.last_error:
             target_data.last_error = err
         return success, mat
@@ -4023,6 +4101,16 @@ class PINSOLVER_OT_bake_animation(Operator):
     bl_options = {'REGISTER', 'UNDO'}
     
     def execute(self, context):
+        global _sequence_refine_owner
+        previous = _sequence_refine_owner
+        camera = context.scene.camera
+        _sequence_refine_owner = camera.pinsolver_data.as_pointer() if camera else None
+        try:
+            return self._execute(context)
+        finally:
+            _sequence_refine_owner = previous
+
+    def _execute(self, context):
         cam_data, target_data, target_obj = get_active_target_data(context)
         if not target_data or not cam_data.target_clip:
             self.report({'WARNING'}, "Select a Movie Clip for sequence solving")
@@ -4213,6 +4301,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         # ----------------------------------------------------
         success_count = 0
         insufficient_pin_frames = set()
+        zoom_calibration_failures = set()
         frames_forward = [f for f in bake_frames if f >= reference_frame]
         frames_backward = sorted([f for f in bake_frames if f < reference_frame], reverse=True)
         chain_pose = ref_result.copy()
@@ -4309,6 +4398,12 @@ class PINSOLVER_OT_bake_animation(Operator):
             nonlocal chain_lens
             context.scene.frame_set(f)
             context.view_layer.update()
+            if auto_raycast_new_tracks and cam_data.calib_animation_mode == 'ZOOM' and cam_data.calib_focal_length and f != reference_frame:
+                direction = 1 if f > reference_frame else -1
+                for pin in pins:
+                    # Rebuild generated anchors from this solve, not a previous bad zoom pose.
+                    if pin.is_auto_raycast_3d and pin.auto_raycast_frame == f and pin.auto_raycast_direction == direction:
+                        pin.has_valid_3d = False
             if f != reference_frame and count_active_pose_pins(context, cam_data, target_data) < min_sequence_pins:
                 insufficient_pin_frames.add(f)
             
@@ -4321,10 +4416,11 @@ class PINSOLVER_OT_bake_animation(Operator):
                 else:
                     p.pos_3d = ref_3d_pos[p.name]
                 
+            calibration_pose = None
             if needs_calib and (cam_data.calib_animation_mode == 'ZOOM' or animated_lens):
                 static_zoom_frame = cam_data.calib_animation_mode == 'ZOOM' and not cam_data.use_dynamic_zoom
-                hold_static_lens = static_zoom_frame and cam_data.calib_focal_length
-                frame_lens = chain_lens if hold_static_lens else input_lens_by_frame.get(f, base_lens)
+                continue_zoom_lens = cam_data.calib_animation_mode == 'ZOOM' and cam_data.calib_focal_length
+                frame_lens = chain_lens if continue_zoom_lens else input_lens_by_frame.get(f, base_lens)
                 if cam_data.calib_focal_length:
                     apply_lens_to_scene_and_clip(context.scene.camera, clip, frame_lens)
                 else:
@@ -4346,13 +4442,18 @@ class PINSOLVER_OT_bake_animation(Operator):
                                 
                     if len(valid_pins) >= PinSolverConfig.MIN_PINS_FOR_CALIBRATION:
                         z_intr, z_dist, zoom_width, zoom_height = get_cv_camera_params(context, cam_data)
+                        zoom_seed = extrapolate_location_pose(
+                            chain_prev_pose, chain_prev_frame, chain_pose, chain_frame, f
+                        ) if cam_data.calib_animation_mode == 'ZOOM' else None
                         
-                        camintr_new, _, _, _, succ, _ = _calibrate_lens(
-                            cam_data, valid_p2ds, valid_pins, zoom_width, zoom_height, z_intr, z_dist, 'initial', context.scene.camera, apply_to_blender=False, zoom_base_intrinsics=z_intr, zoom_base_distcoef=z_dist
+                        camintr_new, _, calib_rvec, calib_tvec, succ, _ = _calibrate_lens(
+                            cam_data, valid_p2ds, valid_pins, zoom_width, zoom_height, z_intr, z_dist, 'initial', context.scene.camera, apply_to_blender=False, zoom_base_intrinsics=z_intr, zoom_base_distcoef=z_dist, initial_pose_matrix=zoom_seed
                         )
                         
                         if succ:
                             calibration_succeeded = True
+                            if zoom_seed is not None and calib_rvec is not None and calib_tvec is not None:
+                                calibration_pose = opencv_pose_to_blender_matrix(calib_rvec,calib_tvec)
                             new_lens = frame_lens * float(camintr_new[0, 0]) / max(1e-8, z_intr[0, 0])
                             new_cx = float(camintr_new[0, 2])
                             new_cy = float(camintr_new[1, 2])
@@ -4364,8 +4465,10 @@ class PINSOLVER_OT_bake_animation(Operator):
                             if cam_data.calib_optical_center:
                                 cam_ref.shift_x = new_sx
                                 cam_ref.shift_y = new_sy
+                    if continue_zoom_lens and not calibration_succeeded:
+                        zoom_calibration_failures.add(f)
                 
-                if cam_data.calib_focal_length and f != reference_frame and (calibration_succeeded or hold_static_lens or not animated_lens):
+                if cam_data.calib_focal_length and f != reference_frame and (calibration_succeeded or continue_zoom_lens or not animated_lens):
                     cam_ref.keyframe_insert("lens", frame=f)
                 if cam_data.calib_optical_center:
                     cam_ref.keyframe_insert("shift_x", frame=f)
@@ -4403,11 +4506,14 @@ class PINSOLVER_OT_bake_animation(Operator):
                 use_acceleration=(stabilize_mode == 'STRONG')
             )
             candidates = []
-            success, result = solve_camera_pose(
-                context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib,
-                initial_pose_matrix=initial_pose,
-                allow_global_fallback=False
-            )
+            if calibration_pose is not None:
+                success, result = True, calibration_pose
+            else:
+                success, result = solve_camera_pose(
+                    context, cam_data, target_data, context.scene.camera, target_mode='initial', skip_calib=needs_calib,
+                    initial_pose_matrix=initial_pose,
+                    allow_global_fallback=False
+                )
             if success and result:
                 candidates.append(result.copy())
                 
@@ -4956,6 +5062,65 @@ class PINSOLVER_OT_bake_animation(Operator):
                         solved_pose_by_frame[f] = corrected_pose.copy()
                         keyframe_current_target(f)
 
+        joint_refined_count = 0
+        if use_matchmove_refinement(cam_data) and HAS_OPENCV and cam_data.solve_mode in {'CAMERA','PARENT'}:
+            window_records = []
+            for f in sorted(solved_pose_by_frame):
+                context.scene.frame_set(f)
+                context.view_layer.update()
+                restore_sequence_pin_positions(context,cam_data,target_obj,pins,ref_3d_pos,ref_local_pos)
+                pose = solved_pose_by_frame[f]
+                intrinsics,distortion,width,height = get_cv_camera_params(context,cam_data)
+                rotation = np.diag((1.,-1.,-1.)) @ np.asarray(pose.to_3x3().transposed())
+                center = np.asarray(pose.translation,dtype=np.float64)
+                eligible = get_sequence_refine_pin_names(pins,f)
+                selected = []
+                pixels = []
+                for pin in pins:
+                    if not pin.use_initial or not pin.has_valid_3d or pin.name not in eligible:
+                        continue
+                    uv = get_current_pin_pos_2d(context,cam_data,pin)
+                    if uv is None or np.dot(np.asarray(pin.pos_3d)-center,rotation[2])<=1e-8:
+                        continue
+                    selected.append(pin)
+                    pixels.append(to_cv_pixel(uv.x,uv.y,width,height))
+                minimum = 2 if use_existing_location else 4
+                if len(selected)<minimum:
+                    continue
+                window_records.append(dict(
+                    frame=f,points=np.asarray([tuple(pin.pos_3d) for pin in selected],dtype=np.float64),
+                    pixels=np.asarray(pixels,dtype=np.float64),intrinsics=intrinsics,distortion=distortion,
+                    rvec=cv2.Rodrigues(rotation)[0].reshape(3),center=center,
+                    weights=np.asarray([reprojection.pin_importance(pin.weight) for pin in selected],dtype=np.float64),
+                    pin_ids=[pin.name for pin in selected],automatic=np.asarray([pin.is_auto_raycast_3d for pin in selected]),
+                    birth_frames=[pin.auto_raycast_frame for pin in selected],scale=reprojection.pixel_scale(width,height),
+                    condition=condition_by_frame.get(f,0.),fixed_center=use_existing_location,
+                    refine_focal=(cam_data.calib_animation_mode=='ZOOM' and cam_data.calib_focal_length and
+                                  cam_data.use_dynamic_zoom and len(selected)>=PinSolverConfig.MIN_PINS_FOR_CALIBRATION),
+                    guide=np.asarray(existing_location_by_frame[f]) if use_guided_location else None,
+                    guide_strength=guided_location_strength if use_guided_location else 0.,lens_mm=float(context.scene.camera.data.lens)))
+            try:
+                joint_results,_ = refine_camera_path(window_records,fixed_reference_frames,effective_stabilize_mode,location_filter_strength)
+            except cv2.error:
+                joint_results = {}
+            for f,record in sorted(joint_results.items()):
+                if f in fixed_reference_frames:
+                    continue
+                context.scene.frame_set(f)
+                restore_sequence_pin_positions(context,cam_data,target_obj,pins,ref_3d_pos,ref_local_pos)
+                rotation = cv2.Rodrigues(record['rvec'])[0]
+                result = opencv_pose_to_blender_matrix(record['rvec'],-rotation @ record['center'])
+                if result is None or not apply_solve_result(context,cam_data,target_data,context.scene.camera,target_obj,result,ref_parent_camera_local):
+                    continue
+                if record['refine_focal']:
+                    original_intrinsics = next(r['intrinsics'] for r in window_records if r['frame']==f)
+                    cam_ref.lens = record['lens_mm']*record['intrinsics'][0,0]/original_intrinsics[0,0]
+                    cam_ref.keyframe_insert('lens',frame=f)
+                keyframe_current_target(f)
+                context.view_layer.update()
+                solved_pose_by_frame[f] = result.copy()
+                joint_refined_count += 1
+
         roll_smoothed_pose_by_frame = stabilize_roll_pose_path(
             solved_pose_by_frame,
             getattr(cam_data, "sequence_roll_smoothing", 'OFF'),
@@ -5032,9 +5197,13 @@ class PINSOLVER_OT_bake_animation(Operator):
         raycast_msg = f" | Auto Raycast: {auto_raycasted_count}" if auto_raycasted_count > 0 else ""
         reraycast_msg = f" | Reprojected: {reraycast_refined_count}" if reraycast_refined_count > 0 else ""
         refine_msg = f" | PnP Refined: {second_pass_refined_count}" if second_pass_refined_count > 0 else ""
+        joint_msg = f" | Window Refined: {joint_refined_count}" if joint_refined_count else ""
         solver_msg = " | Camera Solver disabled" if disabled_solver_count > 0 else ""
         missing_frames = sorted(set(bake_frames) - set(solved_pose_by_frame))
         warning_parts = []
+        if zoom_calibration_failures:
+            frames = sorted(zoom_calibration_failures)
+            warning_parts.append(f"Zoom calibration unavailable: {len(frames)} frames (first {frames[0]}, last {frames[-1]}); previous focal length retained")
         if insufficient_pin_frames:
             frames = sorted(insufficient_pin_frames)
             warning_parts.append(f"Insufficient active pins: {len(frames)} frames (first {frames[0]}, last {frames[-1]}); alignment may be unreliable")
@@ -5044,7 +5213,7 @@ class PINSOLVER_OT_bake_animation(Operator):
         if success_count > 0 and not cam_data.use_reference_frame_lock:
             cam_data.use_reference_frame_lock = True
             cam_data.reference_frame = reference_frame
-        self.report({'WARNING'} if warning_parts else {'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + reraycast_msg + refine_msg + solver_msg + warning_msg)
+        self.report({'WARNING'} if warning_parts else {'INFO'}, f"Baked {success_count} frames" + final_err_msg + raycast_msg + reraycast_msg + refine_msg + joint_msg + solver_msg + warning_msg)
         return {'FINISHED'}
 
 # ==========================================
@@ -6968,6 +7137,8 @@ class PINSOLVER_PT_panel(Panel):
         if cam_data.show_settings:
             settings = context.scene.pinsolver_settings
             col = layout.column(align=True)
+            if cam_data.ui_mode == 'MATCHMOVE':
+                col.prop(settings, "sync_track_selection")
             col.prop(settings, "lock_camera_z")
             col.separator()
             col.prop(settings, "show_name_solve")
@@ -7161,9 +7332,11 @@ class PinSolverAddon:
         bpy.types.Object.pinsolver_data = bpy.props.PointerProperty(type=PinSolverData)
         bpy.types.Scene.pinsolver_settings = bpy.props.PointerProperty(type=PinSolverSettings)
         bpy.types.Scene.pinsolver_icp = bpy.props.PointerProperty(type=PinSolverICPSettings)
+        track_selection.register()
 
     @classmethod
     def unregister(cls):
+        track_selection.unregister()
         for handlers in (bpy.app.handlers.depsgraph_update_post, bpy.app.handlers.load_pre,
                 bpy.app.handlers.undo_post, bpy.app.handlers.redo_post):
             if depth_pick.invalidate in handlers:
