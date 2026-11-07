@@ -51,6 +51,7 @@ PinSolver includes two distinct modes depending on your objective:
 ### Matchmove Mode Features
 *(Recommended for use after aligning the camera initially in Layout Mode.)*
 * **Sync 2D Trackers:** Import markers tracked in Blender's Movie Clip Editor as PinSolver 2D pins with a single click. *(Note: At least 4 active trackers are required at all times.)* 
+* **Track Selection Sync:** With Show Pins enabled in Matchmove mode, selecting a pin selects only its Clip track; selecting tracks in Clip updates the active pin without clearing Clip multi-selection. Toggle `Sync Track Selection` in PinSolver Settings; use `Sync 2D Trackers` to refresh pins after joining, deleting, or renaming tracks.
 * **Auto Raycast:** Automatically shoots rays from the camera through the 2D pin coordinates to hit the 3D model's surface, acquiring and placing all 3D pins in bulk. Pins aimed at empty space are automatically excluded from the calculation. *(If you enable “Auto Raycast New Tracks,” raycasting will be performed automatically during baking.)*
 * **Sequence Solver:** Solves continuously across a specified frame range, automatically baking the camera or object movement into keyframes. Supports focal length changes for zoom lenses.  
 > **Disclaimer:** Please keep in mind that this is a simplified feature and might not work perfectly in all situations. However, because it leverages PnP's absolute 3D constraints, it excels in scenes with minimal parallax or subtle camera movements—exactly the kind of shots where the standard 'Solve' in the Movie Clip Editor usually fails.
@@ -105,7 +106,7 @@ Enable **Custom Range** to limit baking to **In / Out** and preserve existing ke
 * **Timeline Markers** — Uses timeline marker camera positions as references.
 
 
-**Location Filter:** Stabilizes difficult Matchmove solves.
+**Location Filter:** Stabilizes difficult Matchmove solves. Smooth / Hyper Smooth also use robust pin weighting and overlapping 7 / 15-frame camera refinement, including focal length when Zoom estimation is enabled. Window optimization preserves reference poses and does not move 3D pins. This costs additional solve time and applies to camera/parent sequence solves; Off, Single Solve, and Existing Location retain their existing behavior.
 
 **Roll Smoothing:** Reduces sudden roll jitter during Matchmove solving.
 
