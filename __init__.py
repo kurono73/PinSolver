@@ -178,9 +178,9 @@ def get_cv_camera_params(context: bpy.types.Context, cam_data: Any) -> Tuple[np.
         if cam_data.ui_mode == 'MATCHMOVE' and camera_obj:
             max_size = max(clip.size)
             if keyed_fcurves_for_path(camera_obj.data, "shift_x"):
-                optcent[0] = clip.size[0] / 2.0 + camera_obj.data.shift_x * max_size
+                optcent[0] = clip.size[0] / 2.0 - camera_obj.data.shift_x * max_size
             if keyed_fcurves_for_path(camera_obj.data, "shift_y"):
-                optcent[1] = clip.size[1] / 2.0 + camera_obj.data.shift_y * max_size
+                optcent[1] = clip.size[1] / 2.0 - camera_obj.data.shift_y * max_size
             
         camintr = np.array([
             [focal, 0, optcent[0]],
@@ -207,8 +207,8 @@ def get_cv_camera_params(context: bpy.types.Context, cam_data: Any) -> Tuple[np.
         fx = (cam_ref.lens / max(1e-4, sw)) * res_x
         fy = (cam_ref.lens / max(1e-4, sh)) * res_y
         
-        cx = res_x / 2.0 + (cam_ref.shift_x * max_res)
-        cy = res_y / 2.0 - (cam_ref.shift_y * max_res)
+        cx = res_x / 2.0 - (cam_ref.shift_x * max_res)
+        cy = res_y / 2.0 + (cam_ref.shift_y * max_res)
         
         camintr = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
         return camintr, np.zeros(5, dtype=np.float64), res_x, res_y
@@ -229,8 +229,8 @@ def sync_scene_camera_from_clip(context: bpy.types.Context, cam_data: Any) -> bo
     try:
         cam_ref.sensor_width = trk_cam.sensor_width
         cam_ref.lens = trk_cam.focal_length
-        cam_ref.shift_x = (float(optcent[0]) - res_x / 2.0) / max_res
-        cam_ref.shift_y = (float(optcent[1]) - res_y / 2.0) / max_res
+        cam_ref.shift_x = (res_x / 2.0 - float(optcent[0])) / max_res
+        cam_ref.shift_y = (res_y / 2.0 - float(optcent[1])) / max_res
         return True
     except Exception:
         return False
@@ -250,8 +250,8 @@ def sync_clip_camera_from_scene(context: bpy.types.Context, cam_data: Any) -> bo
         res_x = max(1.0, float(clip.size[0]))
         res_y = max(1.0, float(clip.size[1]))
         max_res = max(res_x, res_y)
-        px = res_x / 2.0 + (cam_ref.shift_x * max_res)
-        py = res_y / 2.0 + (cam_ref.shift_y * max_res)
+        px = res_x / 2.0 - (cam_ref.shift_x * max_res)
+        py = res_y / 2.0 - (cam_ref.shift_y * max_res)
         if bpy.app.version < (3, 5, 0): 
             trk_cam.principal = [px, py]
         else: 
@@ -1431,8 +1431,8 @@ def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[An
                     py = res_y - cy_cv
                     if bpy.app.version < (3, 5, 0): trk_cam.principal = [px, py]
                     else: trk_cam.principal_point_pixels = [px, py]
-                    cam_data_ref.shift_x = (cx_cv - res_x / 2.0) / max(res_x, res_y)
-                    cam_data_ref.shift_y = (res_y / 2.0 - cy_cv) / max(res_x, res_y)
+                    cam_data_ref.shift_x = (res_x / 2.0 - cx_cv) / max(res_x, res_y)
+                    cam_data_ref.shift_y = (cy_cv - res_y / 2.0) / max(res_x, res_y)
                 if cam_data.calib_k1 and zoom_base_intrinsics is None: trk_cam.k1 = float(distcoef_new[0])
                 if cam_data.calib_k2 and zoom_base_intrinsics is None: trk_cam.k2 = float(distcoef_new[1])
                 if cam_data.calib_k3 and zoom_base_intrinsics is None: trk_cam.k3 = float(distcoef_new[4])
@@ -1444,8 +1444,8 @@ def _calibrate_lens(cam_data: Any, valid_p2ds: List[Vector], valid_pins: List[An
                 if cam_data.calib_optical_center:
                     cx = float(camintr_new[0, 2])
                     cy = float(camintr_new[1, 2])
-                    cam_data_ref.shift_x = (cx - res_x / 2.0) / max_res
-                    cam_data_ref.shift_y = (res_y / 2.0 - cy) / max_res
+                    cam_data_ref.shift_x = (res_x / 2.0 - cx) / max_res
+                    cam_data_ref.shift_y = (cy - res_y / 2.0) / max_res
                 
         return camintr_new, distcoef_new, rvec_calib, tvec_calib, True, ""
         
@@ -3281,8 +3281,8 @@ class PINSOLVER_OT_sync_clip(PinSolverBaseOperator):
             res_y = float(clip.size[1])
             max_res = max(res_x, res_y)
             
-            px = res_x / 2.0 + (cam_ref.shift_x * max_res)
-            py = res_y / 2.0 + (cam_ref.shift_y * max_res)
+            px = res_x / 2.0 - (cam_ref.shift_x * max_res)
+            py = res_y / 2.0 - (cam_ref.shift_y * max_res)
             
             if bpy.app.version < (3, 5, 0): 
                 trk_cam.principal = [px, py]
@@ -4457,8 +4457,8 @@ class PINSOLVER_OT_bake_animation(Operator):
                             new_lens = frame_lens * float(camintr_new[0, 0]) / max(1e-8, z_intr[0, 0])
                             new_cx = float(camintr_new[0, 2])
                             new_cy = float(camintr_new[1, 2])
-                            new_sx = (new_cx - zoom_width / 2.0) / max(zoom_width, zoom_height)
-                            new_sy = (zoom_height / 2.0 - new_cy) / max(zoom_width, zoom_height)
+                            new_sx = (zoom_width / 2.0 - new_cx) / max(zoom_width, zoom_height)
+                            new_sy = (new_cy - zoom_height / 2.0) / max(zoom_width, zoom_height)
                             
                             if cam_data.calib_focal_length:
                                 apply_lens_to_scene_and_clip(context.scene.camera, clip, new_lens)
